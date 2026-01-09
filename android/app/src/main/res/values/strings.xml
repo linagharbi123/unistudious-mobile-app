@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Unistudious</string>
+    <string name="facebook_app_id">1079998280175837</string>
+    <string name="fb_login_protocol_scheme">fb1079998280175837</string>
+    <string name="facebook_client_token">120182d100b95b0c2aa156efd78d80d0</string>
+</resources>

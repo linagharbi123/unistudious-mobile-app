@@ -1,0 +1,13 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- The INTERNET permission is required for development. Specifically,
+         the Flutter tool needs it to communicate with the running application
+         to allow setting breakpoints, to provide hot reload, etc.
+    -->
+    <application>
+        <meta-data
+            android:name="com.google.android.gms.signin.client_id"
+            android:value="641148541518-j3t36n8duiie6l7uvr8p6v3son4rs4rv.apps.googleusercontent.com" />
+    </application>
+    <uses-permission android:name="android.permission.INTERNET"/>
+</manifest>

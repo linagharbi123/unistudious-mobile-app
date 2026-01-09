@@ -1,0 +1,48 @@
+{
+  "project_info": {
+    "project_number": "270776207159",
+    "project_id": "e-learning-1727876602993",
+    "storage_bucket": "e-learning-1727876602993.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:270776207159:android:3c35591c427ab6b8a3fcb2",
+        "android_client_info": {
+          "package_name": "com.example.neuf_metre_carre"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDgzeh_eDdY9AFc_LWQTR7DuM6tuJ2O_LE"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:270776207159:android:00ebf75b214fa1cca3fcb2",
+        "android_client_info": {
+          "package_name": "com.unistudious.projet1v2"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDgzeh_eDdY9AFc_LWQTR7DuM6tuJ2O_LE"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
