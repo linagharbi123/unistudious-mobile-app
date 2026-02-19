@@ -121,7 +121,10 @@ class _InvoicePageState extends State<InvoicePage> {
     }
 
     setState(() {
+      // Passer immédiatement en vue détails pour avoir l'icône de retour
+      isDetailView = true;
       isDetailLoading = true;
+      errorMessage = null;
     });
 
     try {
@@ -158,28 +161,34 @@ class _InvoicePageState extends State<InvoicePage> {
             isDetailLoading = false;
           });
         } else {
+          // Cas normal : pas de détails disponibles, pas d'erreur à afficher
           setState(() {
-            errorMessage = 'Aucun détail disponible pour cette facture';
             invoiceDetails = [];
             isDetailLoading = false;
-            isDetailView = false;
+            errorMessage = null; // Pas d'erreur, juste une page vide
+            // Garder isDetailView = true pour rester sur la page de détails
+            isDetailView = true;
           });
         }
       } else {
+        // Erreur HTTP : ne pas afficher d'erreur dans la vue détails, juste une page vide
         setState(() {
-          errorMessage = 'Échec du chargement des détails : ${response.statusCode}';
           invoiceDetails = [];
           isDetailLoading = false;
-          isDetailView = false;
+          errorMessage = null; // Ne pas afficher d'erreur dans la vue détails
+          // Garder isDetailView = true pour rester sur la page de détails
+          isDetailView = true;
         });
       }
     } catch (e) {
       developer.log('Erreur de chargement des détails : $e', name: 'InvoicePage');
+      // Ne pas afficher d'erreur dans la vue détails, juste une page vide
       setState(() {
-        errorMessage = 'Erreur : $e';
         invoiceDetails = [];
         isDetailLoading = false;
-        isDetailView = false;
+        errorMessage = null; // Ne pas afficher d'erreur dans la vue détails
+        // Garder isDetailView = true pour rester sur la page de détails
+        isDetailView = true;
       });
     }
   }
@@ -320,7 +329,7 @@ class _InvoicePageState extends State<InvoicePage> {
           },
         ),
         title: Text(
-          isDetailView ? 'Détails des factures' : 'Factures en attente',
+          isDetailView ? 'Détails des factures' : 'Factures',
           style: theme.textTheme.titleLarge?.copyWith(
             color: Colors.white,
             fontFamily: GoogleFonts.poppins().fontFamily,
@@ -347,28 +356,16 @@ class _InvoicePageState extends State<InvoicePage> {
           ),
         ),
       ),
-      drawer: const AppSidebar(),
+      // En vue détails, on n'affiche pas la sidebar pour garder uniquement le bouton retour
+      drawer: isDetailView ? null : const AppSidebar(),
       body: RefreshIndicator(
         onRefresh: fetchInvoices,
         child: isLoading
             ? Center(child: CircularProgressIndicator(color: theme.primaryColor))
-            : errorMessage != null
-            ? Center(
-          child: Text(
-            errorMessage!,
-            style: theme.textTheme.bodyLarge?.copyWith(
-              color: Colors.red[700],
-              fontFamily: GoogleFonts.poppins().fontFamily,
-            ) ??
-                TextStyle(
-                  color: Colors.red[700],
-                  fontSize: 16,
-                  fontFamily: GoogleFonts.poppins().fontFamily,
-                ),
-          ),
-        )
             : isDetailView
-            ? invoiceDetails.isNotEmpty
+            ? isDetailLoading
+            ? Center(child: CircularProgressIndicator(color: theme.primaryColor))
+            : invoiceDetails.isNotEmpty
             ? ListView.builder(
           padding: const EdgeInsets.all(16),
           itemCount: invoiceDetails.length,
@@ -517,14 +514,44 @@ class _InvoicePageState extends State<InvoicePage> {
           },
         )
             : Center(
+          child: Padding(
+            padding: const EdgeInsets.all(16.0),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(
+                  Icons.inbox_outlined,
+                  size: 64,
+                  color: Colors.grey[400],
+                ),
+                const SizedBox(height: 16),
+                Text(
+                  'Cette page est vide',
+                  style: theme.textTheme.bodyLarge?.copyWith(
+                    color: Colors.grey[700],
+                    fontFamily: GoogleFonts.poppins().fontFamily,
+                  ) ??
+                      TextStyle(
+                        color: Colors.grey[700],
+                        fontSize: 16,
+                        fontFamily: GoogleFonts.poppins().fontFamily,
+                      ),
+                  textAlign: TextAlign.center,
+                ),
+              ],
+            ),
+          ),
+        )
+            : errorMessage != null
+            ? Center(
           child: Text(
-            'Aucun détail disponible',
+            errorMessage!,
             style: theme.textTheme.bodyLarge?.copyWith(
-              color: theme.textTheme.bodyLarge?.color ?? Colors.grey[700],
+              color: Colors.red[700],
               fontFamily: GoogleFonts.poppins().fontFamily,
             ) ??
                 TextStyle(
-                  color: Colors.grey[700],
+                  color: Colors.red[700],
                   fontSize: 16,
                   fontFamily: GoogleFonts.poppins().fontFamily,
                 ),

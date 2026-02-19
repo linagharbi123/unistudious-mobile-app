@@ -636,7 +636,7 @@ class _DashboardPageState extends State<DashboardPage>
                                             Row(
                                               children: [
                                                 Text(
-                                                  'Rejoindre une session',
+                                                  'Rejoindre une session', 
                                                   style: GoogleFonts.poppins(
                                                     color: Colors.white,
                                                     fontSize: 20,

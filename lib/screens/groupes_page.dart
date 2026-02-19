@@ -8,9 +8,11 @@ import 'dart:developer' as developer;
 import 'package:intl/intl.dart';
 import 'package:http/http.dart' as http;
 import 'package:cached_network_image/cached_network_image.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../screens/groupe_chat_page.dart';
 import '../providers/auth_provider.dart';
 import '../providers/loading_provider.dart';
+import 'dart:async';
 
 class GroupesPage extends StatefulWidget {
   const GroupesPage({super.key});
@@ -30,6 +32,11 @@ class _GroupesPageState extends State<GroupesPage> {
   // Cache des avatars SVG
   final Map<String, Map<String, dynamic>> _avatarSvgCache = {};
   final Map<String, Future<Map<String, dynamic>>> _avatarFutures = {};
+  
+  String? currentUser;
+  Timer? _refreshTimer; // Timer pour rafraîchir périodiquement la liste
+  // Mémoriser les groupes marqués comme lus localement (pour éviter qu'ils soient re-marqués comme non lus lors du polling)
+  final Set<String> _locallyMarkedAsRead = {};
 
   @override
   void initState() {
@@ -40,8 +47,74 @@ class _GroupesPageState extends State<GroupesPage> {
         final loadingProvider = Provider.of<LoadingProvider>(context, listen: false);
         loadingProvider.hideLoading(); // S'assurer qu'il n'est pas actif
         _checkAuthAndFetchData();
+        // Démarrer le polling pour les mises à jour en temps réel (sans WebSocket)
+        _startRefreshTimer();
       }
     });
+  }
+  
+  @override
+  void dispose() {
+    _refreshTimer?.cancel();
+    super.dispose();
+  }
+  
+  /// Démarre un timer pour rafraîchir périodiquement la liste des groupes
+  void _startRefreshTimer() {
+    _refreshTimer?.cancel();
+    developer.log('🔄 Démarrage du polling pour les mises à jour en temps réel (toutes les 2 secondes)', name: 'GroupesPage');
+    _refreshTimer = Timer.periodic(const Duration(seconds: 2), (timer) {
+      if (!mounted) {
+        timer.cancel();
+        developer.log('⏹️ Arrêt du polling (widget non monté)', name: 'GroupesPage');
+        return;
+      }
+      // Rafraîchir silencieusement la liste des groupes SANS afficher le loader
+      developer.log('🔄 Polling: Rafraîchissement de la liste des groupes...', name: 'GroupesPage');
+      _refreshGroupsSilently().then((_) {
+        developer.log('✅ Polling: Liste des groupes rafraîchie (${mesGroupes.length} groupes privés, ${canauxGeneraux.length} canaux généraux)', name: 'GroupesPage');
+      }).catchError((error) {
+        developer.log('❌ Polling: Erreur lors du rafraîchissement: $error', name: 'GroupesPage');
+      });
+    });
+  }
+  
+  /// Rafraîchit les groupes sans afficher de loader (pour le polling)
+  Future<void> _refreshGroupsSilently() async {
+    if (!mounted) return;
+    final authProvider = Provider.of<AuthProvider>(context, listen: false);
+    
+    if (!authProvider.isLoggedIn) {
+      return;
+    }
+    
+    // Ne pas définir isLoading à true pour éviter d'afficher le loader
+    List<String> errors = [];
+    try {
+      // Exécuter les deux appels en parallèle, même si l'un échoue
+      await Future.wait([
+        _loadMyGroupes().catchError((e) {
+          developer.log('Error _loadMyGroupes (silent): $e');
+          errors.add('Erreur lors du chargement des groupes privés');
+          return null;
+        }),
+        _loadCanauxGeneraux().catchError((e) {
+          developer.log('Error _loadCanauxGeneraux (silent): $e');
+          errors.add('Erreur lors du chargement des canaux généraux');
+          return null;
+        }),
+      ], eagerError: false).timeout(
+        const Duration(seconds: 30),
+        onTimeout: () {
+          developer.log('Timeout lors du chargement silencieux des données');
+          return [];
+        },
+      );
+    } catch (e, s) {
+      developer.log('Error during silent data fetch: $e', error: e, stackTrace: s);
+      // Ne pas afficher d'erreur lors du polling silencieux
+    }
+    // Ne pas définir isLoading à false car on ne l'a pas mis à true
   }
 
   @override
@@ -80,8 +153,9 @@ class _GroupesPageState extends State<GroupesPage> {
       return;
     }
     
-    // Toujours définir isLoading à true au début
-    if (mounted) {
+    // Ne définir isLoading à true QUE si on n'a pas encore de données (premier chargement)
+    final isFirstLoad = mesGroupes.isEmpty && canauxGeneraux.isEmpty;
+    if (mounted && isFirstLoad) {
       setState(() {
         isLoading = true;
         errorMessage = null;
@@ -136,8 +210,8 @@ class _GroupesPageState extends State<GroupesPage> {
         });
       }
     } finally {
-      // TOUJOURS définir isLoading à false dans le finally
-      if (mounted) {
+      // TOUJOURS définir isLoading à false dans le finally (seulement si on l'avait mis à true)
+      if (mounted && isFirstLoad) {
         setState(() {
           isLoading = false;
         });
@@ -166,24 +240,92 @@ class _GroupesPageState extends State<GroupesPage> {
           return;
         }
         final List<dynamic> channels = jsonResponse['channels'] ?? [];
+        developer.log('📥 _loadMyGroupes: reçu ${channels.length} groupes depuis /api/chat/my-channels', name: 'GroupesPage');
+        
+        // Stocker l'ancien état pour détecter les changements
+        final oldGroupes = Map<String, Map<String, dynamic>>.fromEntries(
+          mesGroupes.map((g) => MapEntry(g['room_id']?.toString() ?? '', g))
+        );
+        
         final List<Map<String, dynamic>> loaded = channels.map((channel) {
           final String lastDateStr = channel['last_date'] ?? '';
           final DateTime lastDate = lastDateStr.isNotEmpty
               ? DateTime.parse(lastDateStr).toLocal()
               : DateTime.now();
+          final roomId = channel['room_id']?.toString() ?? channel['id']?.toString() ?? '';
+          final lastMessage = channel['last_message']?.toString() ?? 'Aucun message';
+          
+          // Détecter si c'est un nouveau message
+          final oldGroupe = oldGroupes[roomId];
+          final oldLastDate = oldGroupe?['last_date']?.toString() ?? '';
+          final oldLastMessage = oldGroupe?['last_message']?.toString() ?? '';
+          final isNewMessage = oldGroupe != null && 
+                              (oldLastDate != lastDateStr || oldLastMessage != lastMessage);
+          // Vérifier si l'ancien groupe avait déjà des messages non lus
+          final int oldUnreadCount = (oldGroupe?['unread'] ?? 0) as int;
+          final wasUnread = oldUnreadCount > 0;
+          
+          // Utiliser la valeur de l'API si elle indique des messages non lus
+          final apiUnread = (channel['unread'] ?? 0) as int;
+          
+
+          final wasLocallyMarkedAsRead = _locallyMarkedAsRead.contains(roomId);
+          
+          // Si l'API indique des messages non lus, retirer de la liste des groupes marqués comme lus
+          if (apiUnread > 0 && wasLocallyMarkedAsRead) {
+            _locallyMarkedAsRead.remove(roomId);
+          }
+          
+          final unreadCount = apiUnread > 0 
+              ? apiUnread 
+              : (isNewMessage && !wasUnread && !wasLocallyMarkedAsRead
+                  ? 1 
+                  : (wasUnread && !wasLocallyMarkedAsRead ? oldUnreadCount : 0));
+          
+          if (isNewMessage || unreadCount > 0) {
+            developer.log(
+              '📨 Groupe roomId=$roomId, name=${channel['name']}, lastMessage=${lastMessage.length > 30 ? "${lastMessage.substring(0, 30)}..." : lastMessage}, oldDate=$oldLastDate, newDate=$lastDateStr, apiUnread=$apiUnread, oldUnread=$oldUnreadCount, finalUnread=$unreadCount',
+              name: 'GroupesPage',
+            );
+          }
+          
           return {
             'id': channel['id']?.toString() ?? '',
-            'room_id': channel['room_id']?.toString() ?? channel['id']?.toString() ?? '',
+            'room_id': roomId,
             'name': channel['name']?.toString() ?? 'Groupe sans nom',
             'avatar_url': channel['avatar_url']?.toString() ?? '',
-            'last_message': channel['last_message']?.toString() ?? 'Aucun message',
+            'last_message': lastMessage,
             'time': DateFormat('HH:mm').format(lastDate),
+            'last_date': lastDateStr,
             'members': channel['members'] ?? 0,
-            'unread': channel['unread'] ?? 0,
+            'unread': unreadCount,
             'type': channel['type'] ?? 'private',
             'isLeader': channel['isLeader'] == true,
           };
         }).toList();
+        
+        // Trier les groupes par date du dernier message (les plus récents en haut)
+        loaded.sort((a, b) {
+          final dateA = a['last_date']?.toString() ?? '';
+          final dateB = b['last_date']?.toString() ?? '';
+          if (dateA.isEmpty && dateB.isEmpty) return 0;
+          if (dateA.isEmpty) return 1; // Les groupes sans date en bas
+          if (dateB.isEmpty) return -1; // Les groupes sans date en bas
+          try {
+            final dateTimeA = DateTime.parse(dateA);
+            final dateTimeB = DateTime.parse(dateB);
+            return dateTimeB.compareTo(dateTimeA); // Ordre décroissant (plus récent en haut)
+          } catch (e) {
+            return 0;
+          }
+        });
+        
+        final unreadCount = loaded.where((g) => (g['unread'] as int) > 0).length;
+        developer.log(
+          '✅ _loadMyGroupes terminé: ${loaded.length} groupes, $unreadCount avec messages non lus',
+          name: 'GroupesPage',
+        );
+        
         if (mounted) {
           setState(() {
             mesGroupes = loaded;
@@ -240,24 +382,97 @@ class _GroupesPageState extends State<GroupesPage> {
           return;
         }
         final List<dynamic> channels = jsonResponse['channels'] ?? [];
+        developer.log('📥 _loadCanauxGeneraux: reçu ${channels.length} canaux depuis /api/chat/list-channels', name: 'GroupesPage');
+        
+        // Stocker l'ancien état pour détecter les changements
+        final oldCanaux = Map<String, Map<String, dynamic>>.fromEntries(
+          canauxGeneraux.map((c) => MapEntry(c['room_id']?.toString() ?? '', c))
+        );
+        
         final List<Map<String, dynamic>> loaded = channels.map((channel) {
           final String lastDateStr = channel['last_date'] ?? '';
           final DateTime lastDate = lastDateStr.isNotEmpty
               ? DateTime.parse(lastDateStr).toLocal()
               : DateTime.now();
+          final roomId = channel['room_id']?.toString() ?? channel['id']?.toString() ?? '';
+          final lastMessage = channel['last_message']?.toString() ?? 'Aucun message';
+          
+          // Détecter si c'est un nouveau message
+          final oldCanal = oldCanaux[roomId];
+          final oldLastDate = oldCanal?['last_date']?.toString() ?? '';
+          final oldLastMessage = oldCanal?['last_message']?.toString() ?? '';
+          final isNewMessage = oldCanal != null && 
+                              (oldLastDate != lastDateStr || oldLastMessage != lastMessage);
+          // Vérifier si l'ancien canal avait déjà des messages non lus
+          final int oldUnreadCount = (oldCanal?['unread'] ?? 0) as int;
+          final wasUnread = oldUnreadCount > 0;
+          
+          // Utiliser la valeur de l'API si elle indique des messages non lus
+          final apiUnread = (channel['unread'] ?? 0) as int;
+          
+          // Marquer comme non lu si :
+          // 1. L'API indique des messages non lus (apiUnread > 0) - toujours prioritaire
+          //    Si l'API indique des messages non lus, on retire le canal de la liste des canaux marqués comme lus localement
+          // 2. OU c'est un nouveau message ET ce n'était pas déjà marqué comme lu ET n'a pas été marqué comme lu localement
+          // 3. OU c'était déjà marqué comme non lu ET le canal n'a pas été marqué comme lu localement
+          //    (même si l'API retourne 0, on garde l'état local si le canal avait des messages non lus)
+          final wasLocallyMarkedAsRead = _locallyMarkedAsRead.contains(roomId);
+          
+          // Si l'API indique des messages non lus, retirer de la liste des canaux marqués comme lus
+          if (apiUnread > 0 && wasLocallyMarkedAsRead) {
+            _locallyMarkedAsRead.remove(roomId);
+          }
+          
+          final unreadCount = apiUnread > 0 
+              ? apiUnread 
+              : (isNewMessage && !wasUnread && !wasLocallyMarkedAsRead
+                  ? 1 
+                  : (wasUnread && !wasLocallyMarkedAsRead ? oldUnreadCount : 0));
+          
+          if (isNewMessage) {
+            developer.log(
+              '📨 Nouveau message détecté pour canal roomId=$roomId, name=${channel['name']}, lastMessage=${lastMessage.length > 30 ? "${lastMessage.substring(0, 30)}..." : lastMessage}, oldDate=$oldLastDate, newDate=$lastDateStr, unread=$unreadCount',
+              name: 'GroupesPage',
+            );
+          }
+          
           return {
             'id': channel['id']?.toString() ?? channel['_id']?.toString() ?? '',
-            'room_id': channel['room_id']?.toString() ?? channel['id']?.toString() ?? '',
+            'room_id': roomId,
             'name': channel['name']?.toString() ?? channel['username']?.toString() ?? 'Canal sans nom',
             'avatar_url': channel['avatar_url']?.toString() ?? '',
-            'last_message': channel['last_message']?.toString() ?? 'Aucun message',
+            'last_message': lastMessage,
             'time': DateFormat('HH:mm').format(lastDate),
+            'last_date': lastDateStr,
             'members': channel['members'] ?? 0,
-            'unread': channel['unread'] ?? 0,
+            'unread': unreadCount,
             'type': channel['type'] ?? 'public',
             'isLeader': channel['isLeader'] == true,
           };
         }).toList();
+        
+        // Trier les canaux par date du dernier message (les plus récents en haut)
+        loaded.sort((a, b) {
+          final dateA = a['last_date']?.toString() ?? '';
+          final dateB = b['last_date']?.toString() ?? '';
+          if (dateA.isEmpty && dateB.isEmpty) return 0;
+          if (dateA.isEmpty) return 1; // Les canaux sans date en bas
+          if (dateB.isEmpty) return -1; // Les canaux sans date en bas
+          try {
+            final dateTimeA = DateTime.parse(dateA);
+            final dateTimeB = DateTime.parse(dateB);
+            return dateTimeB.compareTo(dateTimeA); // Ordre décroissant (plus récent en haut)
+          } catch (e) {
+            return 0;
+          }
+        });
+        
+        final unreadCount = loaded.where((c) => (c['unread'] as int) > 0).length;
+        developer.log(
+          '✅ _loadCanauxGeneraux terminé: ${loaded.length} canaux, $unreadCount avec messages non lus',
+          name: 'GroupesPage',
+        );
+        
         if (mounted) {
           setState(() {
             canauxGeneraux = loaded;
@@ -295,9 +510,6 @@ class _GroupesPageState extends State<GroupesPage> {
 
   void _handleUnauthenticated() {
     if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Session expirée. Veuillez vous reconnecter.')),
-      );
       Navigator.pushReplacementNamed(context, '/login');
     }
     Provider.of<AuthProvider>(context, listen: false).logout();
@@ -554,27 +766,9 @@ class _GroupesPageState extends State<GroupesPage> {
                               SnackBar(content: Text('Canal "${nameController.text.trim()}" créé !')),
                             );
                           }
-                        } else {
-                          ScaffoldMessenger.of(pageContext).showSnackBar(
-                            const SnackBar(content: Text('Échec de la création du canal.')),
-                          );
                         }
                       } catch (e) {
-                        // Détecter les erreurs de connexion et ne pas afficher de snackbar
-                        final isNetworkError = e is SocketException || 
-                                               e.toString().contains('SocketException') ||
-                                               e.toString().contains('Failed host lookup') ||
-                                               e.toString().contains('Network is unreachable') ||
-                                               e.toString().contains('Connection refused') ||
-                                               e.toString().contains('Connection timed out') ||
-                                               e.toString().contains('No Internet connection');
-                        
-                        // Ne pas afficher de snackbar pour les erreurs de connexion
-                        if (!isNetworkError) {
-                          ScaffoldMessenger.of(pageContext).showSnackBar(
-                            const SnackBar(content: Text('Erreur réseau ou serveur.')),
-                          );
-                        }
+                        // Erreur silencieuse
                       } finally {
                         if (mounted) loadingProvider.hideLoading();
                       }
@@ -770,6 +964,29 @@ class _GroupesPageState extends State<GroupesPage> {
           itemCount: filteredItems.length,
           itemBuilder: (context, index) {
             final item = filteredItems[index];
+            // Vérifier si le groupe a des messages non lus
+            final unreadValue = item['unread'];
+            // Convertir en int pour la comparaison
+            int unreadInt = 0;
+            if (unreadValue != null) {
+              if (unreadValue is int) {
+                unreadInt = unreadValue;
+              } else if (unreadValue is num) {
+                unreadInt = unreadValue.toInt();
+              } else if (unreadValue == true) {
+                unreadInt = 1;
+              }
+            }
+            final isUnread = unreadInt > 0;
+            
+            // Log pour déboguer seulement si isUnread est true
+            if (isUnread) {
+              developer.log(
+                '🔴 Widget build avec BOLD: name=${item['name']}, unreadValue=$unreadValue, unreadInt=$unreadInt, isUnread=$isUnread',
+                name: 'GroupesPage',
+              );
+            }
+            
             return Card(
               margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
               shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
@@ -777,19 +994,52 @@ class _GroupesPageState extends State<GroupesPage> {
               child: ListTile(
                 leading: _buildAvatarWidget(item['avatar_url'], item['name'], size: 48),
                 title: Text(
-                  item['name'],
-                  style: GoogleFonts.poppins(fontWeight: FontWeight.w600),
+                  item['name'] ?? 'Sans nom',
+                  style: GoogleFonts.poppins(
+                    fontWeight: isUnread ? FontWeight.bold : FontWeight.normal,
+                    fontSize: 16,
+                    color: isDark ? Colors.white : Colors.black87,
+                  ),
                 ),
                 subtitle: Text(
-                  item['last_message'],
+                  item['last_message'] ?? 'Aucun message',
                   overflow: TextOverflow.ellipsis,
-                  style: GoogleFonts.poppins(fontSize: 14),
+                  style: GoogleFonts.poppins(
+                    fontSize: 14,
+                    fontWeight: isUnread ? FontWeight.bold : FontWeight.normal,
+                    color: isDark ? Colors.white70 : Colors.grey[600],
+                  ),
                 ),
                 trailing: Text(
                   item['time'] ?? '',
                   style: GoogleFonts.poppins(fontSize: 12, color: Colors.grey),
                 ),
                 onTap: () async {
+                  // Marquer le groupe comme lu avant d'ouvrir le chat
+                  final roomId = item['room_id']?.toString();
+                  if (roomId != null && item['unread'] != null && (item['unread'] as int) > 0) {
+                    setState(() {
+                      // Mémoriser que ce groupe a été marqué comme lu localement
+                      _locallyMarkedAsRead.add(roomId);
+                      
+                      // Trouver et mettre à jour dans mesGroupes
+                      final groupeIndex = mesGroupes.indexWhere(
+                        (g) => g['room_id']?.toString() == roomId,
+                      );
+                      if (groupeIndex >= 0) {
+                        mesGroupes[groupeIndex]['unread'] = 0;
+                      }
+                      
+                      // Trouver et mettre à jour dans canauxGeneraux
+                      final canalIndex = canauxGeneraux.indexWhere(
+                        (c) => c['room_id']?.toString() == roomId,
+                      );
+                      if (canalIndex >= 0) {
+                        canauxGeneraux[canalIndex]['unread'] = 0;
+                      }
+                    });
+                  }
+                  
                   final result = await Navigator.push(
                     context,
                     MaterialPageRoute(
@@ -802,14 +1052,18 @@ class _GroupesPageState extends State<GroupesPage> {
                       ),
                     ),
                   );
+                  
+                  // Ne pas rafraîchir automatiquement pour éviter de perdre l'état unread des autres groupes
+                  // Le polling se chargera de mettre à jour la liste périodiquement
+                  
                   if (result != null && result is Map && (result['left'] == true || result['deleted'] == true)) {
-                    final roomId = result['roomId']?.toString();
-                    if (roomId != null && mounted) {
+                    final resultRoomId = result['roomId']?.toString();
+                    if (resultRoomId != null && mounted) {
                       setState(() {
                         mesGroupes.removeWhere((g) =>
-                        g['room_id']?.toString() == roomId || g['id']?.toString() == roomId);
+                        g['room_id']?.toString() == resultRoomId || g['id']?.toString() == resultRoomId);
                         canauxGeneraux.removeWhere((c) =>
-                        c['room_id']?.toString() == roomId || c['id']?.toString() == roomId);
+                        c['room_id']?.toString() == resultRoomId || c['id']?.toString() == resultRoomId);
                       });
                     }
                   }

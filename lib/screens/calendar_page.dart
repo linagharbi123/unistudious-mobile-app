@@ -9,6 +9,9 @@ import 'package:intl/intl.dart';
 import 'package:intl/date_symbol_data_local.dart';
 import 'dart:developer' as developer;
 import '../widgets/sidebar.dart';
+import '../widgets/notification_icon_button.dart';
+import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
 
 class CalendarPage extends StatefulWidget {
   const CalendarPage({super.key});
@@ -22,6 +25,8 @@ class _CalendarPageState extends State<CalendarPage> {
   DateTime? _selectedDay;
   Map<DateTime, List<dynamic>> _events = {};
   bool _isLoading = false;
+  bool _isLoadingMore = false;
+  Set<String> _loadedMonths = {}; // Track les mois déjà chargés (format: "YYYY-MM")
 
   @override
   void initState() {
@@ -46,20 +51,129 @@ class _CalendarPageState extends State<CalendarPage> {
     }
 
     await _fetchEvents();
+    // Charger les autres mois en arrière-plan après le chargement initial
+    _loadOtherMonths();
   }
 
-  Future<void> _fetchEvents() async {
-    final authProvider = Provider.of<AuthProvider>(context, listen: false);
+  // Charger les autres mois (précédents et suivants) en arrière-plan
+  Future<void> _loadOtherMonths() async {
+    // Attendre un peu pour ne pas surcharger
+    await Future.delayed(const Duration(milliseconds: 500));
+    
+    // Charger seulement les 2 mois précédents et les 2 mois suivants (au lieu de 3)
+    // pour éviter de surcharger et de recharger inutilement
+    for (int i = -2; i <= 2; i++) {
+      if (i == 0) continue; // Le mois actuel est déjà chargé ou en cours de chargement
+      
+      final targetMonth = DateTime(_focusedDay.year, _focusedDay.month + i, 1);
+      
+      // Vérifier si le mois n'est pas déjà chargé
+      if (!_isMonthLoaded(targetMonth)) {
+        // Charger en arrière-plan sans bloquer l'UI
+        _fetchEvents(loadMore: true, targetMonth: targetMonth).catchError((e) {
+          developer.log('Error loading month ${_getMonthKey(targetMonth)}: $e', name: 'CalendarPage');
+        });
+        
+        // Petit délai entre chaque requête pour ne pas surcharger
+        await Future.delayed(const Duration(milliseconds: 300));
+      } else {
+        developer.log('Month ${_getMonthKey(targetMonth)} already loaded, skipping', name: 'CalendarPage');
+      }
+    }
+  }
 
-    setState(() {
-      _isLoading = true;
-    });
+  // Calculer les dates de début et fin pour le mois visible
+  Map<String, DateTime> _getMonthRange(DateTime focusedDay) {
+    final firstDay = DateTime(focusedDay.year, focusedDay.month, 1);
+    final lastDay = DateTime(focusedDay.year, focusedDay.month + 1, 0);
+    return {
+      'start': firstDay,
+      'end': lastDay,
+    };
+  }
+
+  // Obtenir la clé du mois (format: "YYYY-MM")
+  String _getMonthKey(DateTime date) {
+    return '${date.year}-${date.month.toString().padLeft(2, '0')}';
+  }
+
+  // Formater la date pour l'API (format ISO 8601)
+  String _formatDateForAPI(DateTime date) {
+    return DateFormat('yyyy-MM-dd').format(date);
+  }
+
+  // Vérifier si un mois a déjà été chargé
+  bool _isMonthLoaded(DateTime date) {
+    return _loadedMonths.contains(_getMonthKey(date));
+  }
+
+  // Marquer un mois comme chargé
+  void _markMonthAsLoaded(DateTime date) {
+    _loadedMonths.add(_getMonthKey(date));
+  }
+
+  Future<void> _fetchEvents({bool loadMore = false, DateTime? targetMonth}) async {
+    final authProvider = Provider.of<AuthProvider>(context, listen: false);
+    
+    // Utiliser le mois cible ou le mois focalisé
+    final monthToLoad = targetMonth ?? _focusedDay;
+    
+    // Vérifier si le mois est déjà chargé - ne jamais recharger un mois déjà chargé
+    if (_isMonthLoaded(monthToLoad)) {
+      developer.log('Month ${_getMonthKey(monthToLoad)} already loaded, skipping fetch', name: 'CalendarPage');
+      // Si c'est le chargement principal, s'assurer que l'UI n'est pas en état de chargement
+      if (!loadMore) {
+        setState(() {
+          _isLoading = false;
+        });
+      }
+      return;
+    }
+
+    if (!loadMore) {
+      setState(() {
+        _isLoading = true;
+      });
+    } else {
+      setState(() {
+        _isLoadingMore = true;
+      });
+    }
 
     try {
-      final response = await authProvider.authenticatedRequest(
+      // Calculer startDate et endDate pour le mois à charger
+      final monthRange = _getMonthRange(monthToLoad);
+      final startDate = _formatDateForAPI(monthRange['start']!);
+      final endDate = _formatDateForAPI(monthRange['end']!);
+
+      developer.log('Fetching calendar events from $startDate to $endDate', name: 'CalendarPage');
+
+      // Créer une requête multipart avec form-data
+      final prefs = await SharedPreferences.getInstance();
+      final token = prefs.getString('auth_token') ?? '';
+      
+      if (token.isEmpty) {
+        throw Exception('Aucun token d\'authentification trouvé.');
+      }
+
+      final baseUrl = 'https://www.unistudious.com';
+      final request = http.MultipartRequest(
         'GET',
-        '/api/calender',
+        Uri.parse('$baseUrl/api/calender'),
       );
+
+      // Ajouter les champs form-data
+      request.fields['startDate'] = startDate;
+      request.fields['endDate'] = endDate;
+
+      // Ajouter le token d'authentification
+      request.headers.addAll({
+        'Authorization': 'Bearer $token',
+      });
+
+      // Envoyer la requête
+      final streamedResponse = await request.send().timeout(const Duration(seconds: 30));
+      final response = await http.Response.fromStream(streamedResponse);
 
       developer.log('API Response (calendar): ${response.statusCode} - ${response.body}', name: 'CalendarPage');
 
@@ -75,8 +189,49 @@ class _CalendarPageState extends State<CalendarPage> {
           eventList = [];
         }
 
-        Map<DateTime, List<dynamic>> events = {};
+        // Séparer les événements : ceux avec start/end en premier, puis les autres
+        List<dynamic> priorityEvents = [];
+        List<dynamic> otherEvents = [];
+
+        final monthStart = monthRange['start']!;
+        final monthEnd = monthRange['end']!;
+
         for (var event in eventList) {
+          try {
+            String? startString = event['start'];
+            String? endString = event['end'];
+            
+            // Prioriser les événements qui ont start ET end
+            if (startString != null && startString.isNotEmpty && 
+                endString != null && endString.isNotEmpty) {
+              DateTime? eventStart = DateTime.tryParse(startString)?.toLocal();
+              DateTime? eventEnd = DateTime.tryParse(endString)?.toLocal();
+              
+              if (eventStart != null && eventEnd != null) {
+                // Vérifier si les dates sont dans la plage du mois visible
+                if ((eventStart.isAfter(monthStart.subtract(const Duration(days: 1))) && 
+                     eventStart.isBefore(monthEnd.add(const Duration(days: 1)))) ||
+                    (eventEnd.isAfter(monthStart.subtract(const Duration(days: 1))) && 
+                     eventEnd.isBefore(monthEnd.add(const Duration(days: 1))))) {
+                  priorityEvents.add(event);
+                } else {
+                  otherEvents.add(event);
+                }
+              } else {
+                otherEvents.add(event);
+              }
+            } else {
+              otherEvents.add(event);
+            }
+          } catch (_) {
+            otherEvents.add(event);
+          }
+        }
+
+        // Traiter d'abord les événements prioritaires (avec start/end dans la plage)
+        Map<DateTime, List<dynamic>> newEvents = Map.from(_events);
+        
+        for (var event in priorityEvents) {
           try {
             String? dateString = event['start'];
             DateTime? eventDate;
@@ -86,21 +241,91 @@ class _CalendarPageState extends State<CalendarPage> {
             } else if (event['date'] != null) {
               eventDate = DateTime.tryParse(event['date'])?.toLocal();
             }
-
             if (eventDate != null) {
               final normalizedDate = DateTime(eventDate.year, eventDate.month, eventDate.day);
-              events.putIfAbsent(normalizedDate, () => []);
-              events[normalizedDate]!.add(event);
+              newEvents.putIfAbsent(normalizedDate, () => []);
+              // Éviter les doublons pour une même journée (même id ou même couple start/end)
+              final eventId = event['id']?.toString();
+              final eventStart = event['start']?.toString();
+              final eventEnd = event['end']?.toString();
+              final alreadyExists = newEvents[normalizedDate]!.any((existing) {
+                final existingId = existing['id']?.toString();
+                final existingStart = existing['start']?.toString();
+                final existingEnd = existing['end']?.toString();
+                return (eventId != null && existingId == eventId) ||
+                    (eventStart != null &&
+                        eventEnd != null &&
+                        existingStart == eventStart &&
+                        existingEnd == eventEnd);
+              });
+              if (!alreadyExists) {
+                newEvents[normalizedDate]!.add(event);
+              }
             }
           } catch (_) {
             continue;
           }
         }
 
-        setState(() {
-          _events = events;
-          _isLoading = false;
-        });
+        // Marquer le mois comme chargé
+        _markMonthAsLoaded(monthToLoad);
+
+        // Mettre à jour l'UI immédiatement avec les événements prioritaires
+        if (!loadMore) {
+          setState(() {
+            _events = newEvents;
+            _isLoading = false;
+          });
+        } else {
+          setState(() {
+            _events = newEvents;
+            _isLoadingMore = false;
+          });
+        }
+
+        // Ensuite traiter les autres événements de manière asynchrone
+        if (otherEvents.isNotEmpty) {
+          Future.delayed(const Duration(milliseconds: 100), () {
+            if (mounted) {
+              for (var event in otherEvents) {
+                try {
+                  String? dateString = event['start'] ?? event['date'];
+                  DateTime? eventDate;
+
+                  if (dateString != null && dateString.isNotEmpty) {
+                    eventDate = DateTime.tryParse(dateString)?.toLocal();
+                  }
+
+                  if (eventDate != null) {
+                    final normalizedDate = DateTime(eventDate.year, eventDate.month, eventDate.day);
+                    setState(() {
+                      _events.putIfAbsent(normalizedDate, () => []);
+                      // Éviter les doublons pour une même journée (même id ou même couple start/end)
+                      final eventId = event['id']?.toString();
+                      final eventStart = event['start']?.toString();
+                      final eventEnd = event['end']?.toString();
+                      final alreadyExists = _events[normalizedDate]!.any((existing) {
+                        final existingId = existing['id']?.toString();
+                        final existingStart = existing['start']?.toString();
+                        final existingEnd = existing['end']?.toString();
+                        return (eventId != null && existingId == eventId) ||
+                            (eventStart != null &&
+                                eventEnd != null &&
+                                existingStart == eventStart &&
+                                existingEnd == eventEnd);
+                      });
+                      if (!alreadyExists) {
+                        _events[normalizedDate]!.add(event);
+                      }
+                    });
+                  }
+                } catch (_) {
+                  continue;
+                }
+              }
+            }
+          });
+        }
       } else {
         throw Exception('Failed to load events: ${response.statusCode}');
       }
@@ -116,14 +341,13 @@ class _CalendarPageState extends State<CalendarPage> {
                              e.toString().contains('Connection timed out') ||
                              e.toString().contains('No Internet connection');
       
-      setState(() => _isLoading = false);
-      
-      // Ne pas afficher de snackbar pour les erreurs de connexion
-      if (!isNetworkError) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Erreur lors du chargement : $e')),
-        );
+      if (!loadMore) {
+        setState(() => _isLoading = false);
+      } else {
+        setState(() => _isLoadingMore = false);
       }
+      
+      // Erreur silencieuse
     }
   }
 
@@ -195,6 +419,9 @@ class _CalendarPageState extends State<CalendarPage> {
             ),
           ),
         ),
+        actions: [
+          const NotificationIconButton(),
+        ],
       ),
       drawer: const AppSidebar(),
       body: SafeArea(
@@ -214,6 +441,21 @@ class _CalendarPageState extends State<CalendarPage> {
               calendarFormat: CalendarFormat.month,
               selectedDayPredicate: (day) => isSameDay(_selectedDay, day),
               onDaySelected: _onDaySelected,
+              onPageChanged: (focusedDay) {
+                setState(() {
+                  _focusedDay = focusedDay;
+                });
+                // Charger le mois seulement s'il n'est pas déjà chargé
+                if (!_isMonthLoaded(focusedDay)) {
+                  _fetchEvents();
+                  // Charger les autres mois en arrière-plan (seulement ceux non chargés)
+                  _loadOtherMonths();
+                } else {
+                  developer.log('Month ${_getMonthKey(focusedDay)} already loaded, no fetch needed', name: 'CalendarPage');
+                  // Ne pas recharger, juste charger les mois adjacents non chargés en arrière-plan
+                  _loadOtherMonths();
+                }
+              },
               eventLoader: _getEventsForDay,
               calendarStyle: CalendarStyle(
                 todayDecoration: BoxDecoration(

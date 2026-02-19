@@ -14,10 +14,12 @@ import 'Payment_Policy.dart';
 import 'Refund_Policy.dart';
 import 'push_notification_profile_page.dart';
 import 'password_auth_page.dart';
+import 'delete_account_page.dart';
 import 'theme_customization_page.dart';
 import 'blocked_users_page.dart';
 import 'notifications_list_page.dart';
 import '../providers/notifications_list_provider.dart';
+import '../widgets/notification_icon_button.dart';
 
 class SettingsPage extends StatefulWidget {
   @override
@@ -77,10 +79,7 @@ class _SettingsPageState extends State<SettingsPage> {
       Provider.of<BottomNavigationProvider>(context, listen: false).updateIndex(0);
       Navigator.pushReplacementNamed(context, '/welcome');
     } catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Erreur lors de la déconnexion : $e')),
-      );
+      // Erreur silencieuse
     }
   }
 
@@ -114,6 +113,9 @@ class _SettingsPageState extends State<SettingsPage> {
             ),
           ),
         ),
+        actions: [
+          const NotificationIconButton(),
+        ],
       ),
       drawer: AppSidebar(),
       body: Container(
@@ -141,6 +143,23 @@ class _SettingsPageState extends State<SettingsPage> {
                 Navigator.push(
                   context,
                   MaterialPageRoute(builder: (context) => PasswordAuthPage()),
+                );
+              },
+              theme: theme,
+            ),
+            _buildMenuItem(
+              icon: Icons.delete_forever,
+              iconColor: Colors.redAccent,
+              title: 'Supprimer mon compte',
+              subtitle:
+                  'Suppression définitive du compte après vérification par e-mail',
+              textColor: Colors.redAccent,
+              onTap: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (context) => const DeleteAccountPage(),
+                  ),
                 );
               },
               theme: theme,

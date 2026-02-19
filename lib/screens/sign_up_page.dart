@@ -101,12 +101,13 @@ class _SignUpPageState extends State<SignUpPage> {
   }
 
   String? _validatePhone(String? value) {
-    if (value == null || value.isEmpty) {
-      return 'Le numéro de téléphone est requis';
-    }
-    // Validation simple pour numéro de téléphone (8 chiffres pour Tunisie)
-    if (!RegExp(r'^\d{8}$').hasMatch(value.replaceAll(RegExp(r'[^\d]'), ''))) {
-      return 'Numéro de téléphone invalide (8 chiffres)';
+    // Le numéro de téléphone est maintenant optionnel : on ne valide que s'il est renseigné
+    if (value != null && value.isNotEmpty) {
+      // Validation simple pour numéro de téléphone (8 chiffres pour Tunisie)
+      if (!RegExp(r'^\d{8}$')
+          .hasMatch(value.replaceAll(RegExp(r'[^\d]'), ''))) {
+        return 'Numéro de téléphone invalide (8 chiffres)';
+      }
     }
     return null;
   }
@@ -459,13 +460,13 @@ class _SignUpPageState extends State<SignUpPage> {
                     borderColor: isDark ? Colors.grey[600] : Colors.grey[300],
                   ),
 
-                  _buildElevatedButton(
-                    onPressed: () {}, // TODO: Facebook sign-in
-                    label: 'Continuer avec Facebook',
-                    icon: Icons.facebook,
-                    backgroundColor: const Color(0xFF1877F2),
-                    foregroundColor: Colors.white,
-                  ),
+                  //_buildElevatedButton(
+                    //onPressed: () {}, // TODO: Facebook sign-in
+                    //label: 'Continuer avec Facebook',
+                    //icon: Icons.facebook,
+                    //backgroundColor: const Color(0xFF1877F2),
+                    //foregroundColor: Colors.white,
+                  //),
 
                   if (Platform.isIOS)
                     _buildElevatedButton(

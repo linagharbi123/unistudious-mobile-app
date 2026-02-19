@@ -15,35 +15,31 @@ class FacebookLoginPage extends StatelessWidget {
     try {
       final facebookAuth = FacebookAuth.instance;
 
-      // 1. Vérifie si un token existe déjà
-      AccessToken? accessToken = await facebookAuth.accessToken;
-
-      // 2. Si pas de token, lance login
-      if (accessToken == null) {
-        final LoginResult loginResult = await facebookAuth.login(
-          permissions: ['email', 'public_profile'],
-          loginBehavior: LoginBehavior.webOnly, // Force l'utilisation du navigateur web au lieu de l'app native
-        );
-
-        if (loginResult.status == LoginStatus.cancelled) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('Connexion Facebook annulée')),
-          );
-          Navigator.pop(context);
-          return;
-        }
-
-        if (loginResult.status != LoginStatus.success || loginResult.accessToken == null) {
-          final error = loginResult.message ?? 'Erreur inconnue';
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('Connexion Facebook échouée : $error')),
-          );
-          Navigator.pop(context);
-          return;
-        }
-
-        accessToken = loginResult.accessToken!;
+      // 1. Déconnecte d'abord pour forcer la sélection de compte (comme Google)
+      try {
+        await facebookAuth.logOut();
+        debugPrint('[FacebookLoginPage] Déconnexion effectuée pour forcer la sélection de compte');
+      } catch (e) {
+        debugPrint('[FacebookLoginPage] Erreur déconnexion (ignorée): $e');
       }
+
+      // 2. Lance le login avec interface web pour sélection de compte
+      final LoginResult loginResult = await facebookAuth.login(
+        permissions: ['email', 'public_profile'],
+        loginBehavior: LoginBehavior.webOnly, // Utilise le navigateur web pour afficher la page de sélection de compte
+      );
+
+      if (loginResult.status == LoginStatus.cancelled) {
+        Navigator.pop(context);
+        return;
+      }
+
+      if (loginResult.status != LoginStatus.success || loginResult.accessToken == null) {
+        Navigator.pop(context);
+        return;
+      }
+
+      final AccessToken accessToken = loginResult.accessToken!;
 
       final String fbToken = accessToken.token;
       debugPrint('[FacebookLoginPage] ✅ AccessToken : $fbToken');
@@ -97,17 +93,10 @@ class FacebookLoginPage extends StatelessWidget {
           throw Exception("❌ Aucun token JWT dans la réponse.");
         }
       } else {
-        final error = jsonDecode(response.body)['message'] ?? 'Erreur inconnue';
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('❌ Erreur backend : $error')),
-        );
         Navigator.pop(context);
       }
     } catch (e, stack) {
       debugPrint('[FacebookLoginPage] ❌ Exception : $e\n$stack');
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Erreur lors de la connexion Facebook : $e')),
-      );
       Navigator.pop(context);
     }
   }

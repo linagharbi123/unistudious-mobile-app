@@ -2658,8 +2658,38 @@ class _AudioPlayerScreenState extends State<_AudioPlayerScreen> {
         // Pour les fichiers locaux, utiliser DeviceFileSource
         await _audioPlayer.setSource(DeviceFileSource(widget.audioUrl));
       } else {
-        // Pour les URLs, utiliser setSourceUrl
-        await _audioPlayer.setSourceUrl(widget.audioUrl);
+        // Sur iOS, AVPlayer peut avoir des problèmes avec certains formats M4A/MP3 depuis des URLs distantes.
+        // On télécharge toujours le fichier sur iOS avant de le lire pour garantir la compatibilité.
+        if (io.Platform.isIOS) {
+          final prefs = await SharedPreferences.getInstance();
+          final token = prefs.getString('auth_token') ?? '';
+          
+          final uri = Uri.parse(widget.audioUrl);
+          final headers = <String, String>{};
+          if (token.isNotEmpty) {
+            headers['Authorization'] = 'Bearer $token';
+          }
+          
+          final response = await http.get(uri, headers: headers).timeout(const Duration(seconds: 30));
+          if (response.statusCode != 200) {
+            throw Exception('HTTP ${response.statusCode} lors du chargement de l\'audio');
+          }
+
+          final tempDir = await getTemporaryDirectory();
+          final fileNameFromUrl = uri.pathSegments.isNotEmpty
+              ? uri.pathSegments.last
+              : '${DateTime.now().millisecondsSinceEpoch}.m4a';
+          final sanitizedName = fileNameFromUrl.replaceAll('/', '_').replaceAll('\\', '_');
+          final tempFile = io.File(
+            '${tempDir.path}/chat_audio_${DateTime.now().millisecondsSinceEpoch}_$sanitizedName',
+          );
+          await tempFile.writeAsBytes(response.bodyBytes);
+
+          await _audioPlayer.setSource(DeviceFileSource(tempFile.path));
+        } else {
+          // Pour les URLs sur Android, utiliser setSourceUrl
+          await _audioPlayer.setSourceUrl(widget.audioUrl);
+        }
       }
 
       _audioPlayer.onPlayerStateChanged.listen((state) {

@@ -6,7 +6,6 @@ import '../providers/auth_provider.dart';
 import '../providers/theme_provider.dart';
 import '../services/firebase_notification_service.dart';
 import 'package:flutter/foundation.dart';
-import 'package:flutter/services.dart';
 import 'dart:convert';
 
 class PushNotificationProfilePage extends StatefulWidget {
@@ -25,32 +24,53 @@ class _PushNotificationProfilePageState
   bool _pushNotification = false;
   bool _smsNotification = false;
   bool _loginNotification = false;
-  String? _fcmToken;
-  bool _isLoadingToken = false;
 
   @override
   void initState() {
     super.initState();
-    _loadNotificationData();
-    _loadFCMToken();
+    // Charger immédiatement les préférences locales avant le premier build
+    _loadLocalPreferencesImmediately().then((_) {
+      // Une fois les valeurs locales chargées, synchroniser avec le serveur en arrière-plan
+      _loadNotificationData();
+      _loadFCMToken();
+    });
   }
 
-  Future<void> _loadFCMToken() async {
-    setState(() => _isLoadingToken = true);
-    try {
-      final token = await FirebaseNotificationService.getToken();
+  /// Charge immédiatement les préférences locales pour afficher l'état correct sans délai
+  Future<void> _loadLocalPreferencesImmediately() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (mounted) {
       setState(() {
-        _fcmToken = token;
-        _isLoadingToken = false;
+        _generalNotification = prefs.getBool('generalNotification') ?? false;
+        _messageNotification = prefs.getBool('messageNotification') ?? false;
+        _calendarNotification = prefs.getBool('calendarNotification') ?? false;
+        _pushNotification = prefs.getBool('pushNotification') ?? false;
+        _smsNotification = prefs.getBool('smsNotification') ?? false;
+        _loginNotification = prefs.getBool('loginNotification') ?? false;
       });
-    } catch (e) {
-      if (kDebugMode) {
-        print('❌ Erreur lors du chargement du token FCM: $e');
-      }
-      setState(() => _isLoadingToken = false);
+      debugPrint("📱 Local preferences loaded immediately");
     }
   }
 
+  Future<void> _loadFCMToken() async {
+    // Sauvegarder automatiquement le token FCM sur le serveur en arrière-plan
+    try {
+      final token = await FirebaseNotificationService.getToken();
+      if (token != null) {
+        final authProvider = Provider.of<AuthProvider>(context, listen: false);
+        final authToken = authProvider.currentToken;
+        if (authToken != null) {
+          await FirebaseNotificationService.saveTokenToServer(token, authToken);
+        }
+      }
+    } catch (e) {
+      if (kDebugMode) {
+        print('❌ Erreur lors de la sauvegarde du token FCM: $e');
+      }
+    }
+  }
+
+  /// Charge les données depuis l'API en arrière-plan pour synchroniser avec le serveur
   Future<void> _loadNotificationData({String? updatedKey, bool? updatedValue}) async {
     final authProvider = Provider.of<AuthProvider>(context, listen: false);
     final token = authProvider.token;
@@ -79,57 +99,86 @@ class _PushNotificationProfilePageState
         final data = json.decode(response.body);
         final notificationData = data['notification_data'];
 
-        setState(() {
-          _generalNotification =
-          updatedKey == 'generalNotification'
-              ? updatedValue ?? localPrefs['generalNotification']!
-              : localPrefs['generalNotification']!;
-          _messageNotification =
-          updatedKey == 'messageNotification'
-              ? updatedValue ?? localPrefs['messageNotification']!
-              : localPrefs['messageNotification']!;
-          _calendarNotification =
-          updatedKey == 'calendarNotification'
-              ? updatedValue ?? localPrefs['calendarNotification']!
-              : localPrefs['calendarNotification']!;
-          _pushNotification =
-          updatedKey == 'pushNotification'
-              ? updatedValue ?? localPrefs['pushNotification']!
-              : localPrefs['pushNotification']!;
-          _smsNotification =
-          updatedKey == 'smsNotification'
-              ? updatedValue ?? localPrefs['smsNotification']!
-              : localPrefs['smsNotification']!;
-          _loginNotification =
-          updatedKey == 'loginNotification'
-              ? updatedValue ?? localPrefs['loginNotification']!
-              : localPrefs['loginNotification']!;
-        });
+        // Mettre à jour les valeurs depuis l'API seulement si elles sont différentes
+        // et seulement si aucune clé n'a été mise à jour manuellement
+        if (updatedKey == null && notificationData != null) {
+          // Les clés de l'API sont: general, message, calendar, push, sms, login
+          // Convertir les valeurs (peuvent être bool, int, ou string)
+          bool _parseBoolValue(dynamic value) {
+            if (value == null) return false;
+            if (value is bool) return value;
+            if (value is int) return value == 1;
+            if (value is String) return value == "1" || value.toLowerCase() == "true";
+            return false;
+          }
 
-        await _saveAllPreferences();
-        debugPrint("🔄 Notification data loaded from API: $notificationData");
+          final apiValues = {
+            'generalNotification': _parseBoolValue(notificationData['general']),
+            'messageNotification': _parseBoolValue(notificationData['message']),
+            'calendarNotification': _parseBoolValue(notificationData['calendar']),
+            'pushNotification': _parseBoolValue(notificationData['push']),
+            'smsNotification': _parseBoolValue(notificationData['sms']),
+            'loginNotification': _parseBoolValue(notificationData['login']),
+          };
 
-        final syncSuccess = await _syncAllPreferencesToApi();
-        if (!syncSuccess && mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text('Changes saved locally, but server sync failed.'),
-              backgroundColor: Colors.red[600],
-            ),
-          );
+          debugPrint("📊 API values parsed: $apiValues");
+          debugPrint("📊 Local values: $localPrefs");
+
+          // Vérifier si les valeurs de l'API sont différentes des valeurs locales
+          bool needsUpdate = 
+              apiValues['generalNotification'] != localPrefs['generalNotification'] ||
+              apiValues['messageNotification'] != localPrefs['messageNotification'] ||
+              apiValues['calendarNotification'] != localPrefs['calendarNotification'] ||
+              apiValues['pushNotification'] != localPrefs['pushNotification'] ||
+              apiValues['smsNotification'] != localPrefs['smsNotification'] ||
+              apiValues['loginNotification'] != localPrefs['loginNotification'];
+
+          debugPrint("🔄 Needs update: $needsUpdate");
+
+          // Toujours mettre à jour avec les valeurs de l'API si elles existent
+          if (mounted) {
+            setState(() {
+              _generalNotification = apiValues['generalNotification']!;
+              _messageNotification = apiValues['messageNotification']!;
+              _calendarNotification = apiValues['calendarNotification']!;
+              _pushNotification = apiValues['pushNotification']!;
+              _smsNotification = apiValues['smsNotification']!;
+              _loginNotification = apiValues['loginNotification']!;
+            });
+            await _saveAllPreferences();
+            debugPrint("✅ Notification data synced from API and saved locally");
+          }
+        } else if (updatedKey != null && updatedValue != null) {
+          // Si une clé a été mise à jour manuellement, utiliser cette valeur
+          setState(() {
+            switch (updatedKey) {
+              case 'generalNotification':
+                _generalNotification = updatedValue;
+                break;
+              case 'messageNotification':
+                _messageNotification = updatedValue;
+                break;
+              case 'calendarNotification':
+                _calendarNotification = updatedValue;
+                break;
+              case 'pushNotification':
+                _pushNotification = updatedValue;
+                break;
+              case 'smsNotification':
+                _smsNotification = updatedValue;
+                break;
+              case 'loginNotification':
+                _loginNotification = updatedValue;
+                break;
+            }
+          });
+          await _saveAllPreferences();
         }
       }
     } catch (e) {
       debugPrint("🔥 Exception fetching /api/my-profile: $e");
-      setState(() {
-        _generalNotification = localPrefs['generalNotification']!;
-        _messageNotification = localPrefs['messageNotification']!;
-        _calendarNotification = localPrefs['calendarNotification']!;
-        _pushNotification = localPrefs['pushNotification']!;
-        _smsNotification = localPrefs['smsNotification']!;
-        _loginNotification = localPrefs['loginNotification']!;
-      });
-      await _syncAllPreferencesToApi();
+      // En cas d'erreur, garder les valeurs locales déjà chargées
+      // Pas besoin de mettre à jour l'état car les valeurs locales sont déjà affichées
     }
   }
 
@@ -246,6 +295,9 @@ class _PushNotificationProfilePageState
 
   Future<bool> _updateNotificationProfile(
       String endpoint, String key, String responseKey, bool value) async {
+    // Sauvegarder immédiatement localement pour un feedback instantané
+    await _savePreference(key, value);
+    
     final url = Uri.parse('https://www.unistudious.com$endpoint');
     final authProvider = Provider.of<AuthProvider>(context, listen: false);
     final token = authProvider.token;
@@ -267,16 +319,15 @@ class _PushNotificationProfilePageState
       if (response.statusCode == 200) {
         final data = json.decode(response.body);
         if (data['success'] == true) {
-          await _savePreference(key, value);
           debugPrint("✅ Update successful for $key");
           return true;
         }
       }
-      await _savePreference(key, value);
+      // Même en cas d'échec, la valeur est déjà sauvegardée localement
       return false;
     } catch (e) {
       debugPrint("🔥 API Exception: $e");
-      await _savePreference(key, value);
+      // Même en cas d'erreur, la valeur est déjà sauvegardée localement
       return false;
     }
   }
@@ -326,8 +377,6 @@ class _PushNotificationProfilePageState
         child: ListView(
           padding: const EdgeInsets.all(16.0),
           children: [
-            // Section Token FCM pour les tests
-            if (kDebugMode) _buildFCMTokenCard(theme),
             _buildSwitchTile(
               icon: Icons.notifications,
               title: "General Notifications",
@@ -418,105 +467,6 @@ class _PushNotificationProfilePageState
                 );
               },
             ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildFCMTokenCard(ThemeData theme) {
-    return Card(
-      color: theme.cardColor,
-      margin: const EdgeInsets.only(bottom: 16.0),
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-      child: Padding(
-        padding: const EdgeInsets.all(16.0),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                Icon(Icons.vpn_key, color: Colors.deepPurple),
-                const SizedBox(width: 12),
-                Text(
-                  'Token FCM (Debug)',
-                  style: theme.textTheme.titleMedium?.copyWith(
-                    fontWeight: FontWeight.bold,
-                  ) ?? const TextStyle(
-                    fontSize: 16,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 12),
-            if (_isLoadingToken)
-              const Center(child: CircularProgressIndicator())
-            else if (_fcmToken != null)
-              Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  SelectableText(
-                    _fcmToken!,
-                    style: theme.textTheme.bodySmall?.copyWith(
-                      fontFamily: 'monospace',
-                      fontSize: 11,
-                    ),
-                  ),
-                  const SizedBox(height: 8),
-                  Row(
-                    children: [
-                      Expanded(
-                        child: ElevatedButton.icon(
-                          onPressed: () async {
-                            if (_fcmToken != null) {
-                              await Clipboard.setData(ClipboardData(text: _fcmToken!));
-                              if (kDebugMode) {
-                                print('📋 Token FCM copié: $_fcmToken');
-                              }
-                              if (mounted) {
-                                ScaffoldMessenger.of(context).showSnackBar(
-                                  const SnackBar(
-                                    content: Text('Token copié dans le presse-papier'),
-                                    duration: Duration(seconds: 2),
-                                  ),
-                                );
-                              }
-                            }
-                          },
-                          icon: const Icon(Icons.copy, size: 18),
-                          label: const Text('Copier'),
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: Colors.deepPurple,
-                            foregroundColor: Colors.white,
-                            padding: const EdgeInsets.symmetric(vertical: 8),
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: ElevatedButton.icon(
-                          onPressed: _loadFCMToken,
-                          icon: const Icon(Icons.refresh, size: 18),
-                          label: const Text('Actualiser'),
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: Colors.grey[600],
-                            foregroundColor: Colors.white,
-                            padding: const EdgeInsets.symmetric(vertical: 8),
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                ],
-              )
-            else
-              Text(
-                'Token non disponible',
-                style: theme.textTheme.bodyMedium?.copyWith(
-                  color: Colors.grey,
-                ),
-              ),
           ],
         ),
       ),

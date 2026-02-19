@@ -22,11 +22,11 @@ import '../providers/auth_provider.dart';
 import '../providers/loading_provider.dart';
 import '../utils/snackbar_helper.dart';
 
-import '../services/rocketchat_websocket_service.dart';
 
 import '../widgets/loading_wrapper.dart';
 
 import '../widgets/sidebar.dart';
+import '../widgets/notification_icon_button.dart';
 
 import '../screens/groupes_page.dart';
 
@@ -110,19 +110,14 @@ class _MessageriePageState extends State<MessageriePage>
 
   final Map<String, Map<String, dynamic>> _avatarSvgCache = {};
 
-  // WebSocket service
-
-  final RocketChatWebSocketService _wsService = RocketChatWebSocketService();
-
-  StreamSubscription<Map<String, dynamic>>? _wsMessageSubscription;
-
-  StreamSubscription<String>? _wsDeleteSubscription;
-
-  StreamSubscription<bool>? _wsConnectionSubscription;
+  // Cache des futures pour éviter de recharger les SVG à chaque rebuild
+  final Map<String, Future<Map<String, dynamic>>> _avatarFutures = {};
 
   bool isConnectionError = false;
 
   Timer? _connectionCheckTimer;
+  
+  Timer? _refreshTimer; // Timer pour rafraîchir périodiquement la liste
 
   @override
 
@@ -153,7 +148,8 @@ class _MessageriePageState extends State<MessageriePage>
 
         _checkAuthAndFetchData();
 
-        _initializeWebSocket();
+        // Démarrer le polling pour les mises à jour en temps réel (sans WebSocket)
+        _startRefreshTimer();
 
       }
 
@@ -180,244 +176,7 @@ class _MessageriePageState extends State<MessageriePage>
     });
   }
 
-  void _initializeWebSocket() {
 
-    // Initialiser le WebSocket sans roomId spécifique pour écouter tous les messages
-
-    _wsService.initialize().then((_) {
-
-      if (!mounted) return;
-
-      // Écouter les nouveaux messages
-
-      _wsMessageSubscription?.cancel();
-
-      _wsMessageSubscription = _wsService.messageStream.listen((wsMessage) {
-
-        if (!mounted) return;
-
-        _handleWebSocketMessage(wsMessage);
-
-      }, onError: (error) {
-
-        developer.log('WebSocket message stream error: $error', name: 'MessageriePage');
-
-      });
-
-      // Écouter les suppressions de messages
-
-      _wsDeleteSubscription?.cancel();
-
-      _wsDeleteSubscription = _wsService.deleteMessageStream.listen((messageId) {
-
-        if (!mounted) return;
-
-        // Optionnel: gérer les suppressions si nécessaire
-
-        developer.log('Message deleted: $messageId', name: 'MessageriePage');
-
-      }, onError: (error) {
-
-        developer.log('WebSocket delete stream error: $error', name: 'MessageriePage');
-
-      });
-
-      // Écouter les changements de connexion
-
-      _wsConnectionSubscription?.cancel();
-
-      _wsConnectionSubscription = _wsService.connectionStream.listen((isConnected) {
-
-        if (!mounted) return;
-
-        developer.log('WebSocket connection status: $isConnected', name: 'MessageriePage');
-
-        // Si la connexion est établie, s'assurer qu'on écoute tous les messages
-        if (isConnected) {
-
-          developer.log('WebSocket connected, listening to all room messages', name: 'MessageriePage');
-
-        } else {
-
-          developer.log('WebSocket disconnected, will reconnect automatically', name: 'MessageriePage');
-
-        }
-
-      }, onError: (error) {
-
-        developer.log('WebSocket connection stream error: $error', name: 'MessageriePage');
-
-      });
-
-    }).catchError((error) {
-
-      developer.log('Error initializing WebSocket: $error', name: 'MessageriePage', error: error);
-
-      // Réessayer après un délai en cas d'erreur
-      Future.delayed(const Duration(seconds: 5), () {
-
-        if (mounted) {
-
-          developer.log('Retrying WebSocket initialization...', name: 'MessageriePage');
-
-          _initializeWebSocket();
-
-        }
-
-      });
-
-    });
-
-  }
-
-  void _handleWebSocketMessage(Map<String, dynamic> wsMessage) {
-
-    if (!mounted) return;
-
-    // Ignorer les mises à jour de messages (éditions, réactions, etc.)
-    // On ne veut mettre à jour que les nouveaux messages
-    if (wsMessage['isUpdate'] == true) {
-      developer.log('WebSocket message is an update, skipping conversation list update', name: 'MessageriePage');
-      return;
-    }
-
-    // Extraire les informations du message
-    final roomId = wsMessage['rid'] ?? wsMessage['roomId'];
-
-    // Extraire le texte du message
-    String messageText = wsMessage['text'] ?? '';
-    
-    // Si le message est vide mais qu'il y a des attachments ou un fichier
-    if (messageText.isEmpty) {
-      if (wsMessage['attachments'] != null && (wsMessage['attachments'] as List).isNotEmpty) {
-        messageText = wsMessage['attachments'][0]['title'] ?? 'Pièce jointe';
-      } else if (wsMessage['file'] != null) {
-        messageText = wsMessage['file']['name'] ?? 'Fichier';
-      } else if (wsMessage['type'] == 'attachment') {
-        messageText = 'Pièce jointe';
-      }
-    }
-
-    final messageTimestamp = wsMessage['timestamp'] ?? DateTime.now().toIso8601String();
-
-    final authorUsername = wsMessage['username'] ?? '';
-
-    final authorName = wsMessage['name'] ?? '';
-
-    // Ignorer les messages envoyés par l'utilisateur courant (pas besoin de mettre à jour la liste)
-    if (authorUsername == currentUser) {
-      developer.log('WebSocket message from current user, skipping conversation list update', name: 'MessageriePage');
-      return;
-    }
-
-    if (roomId == null || roomId.toString().isEmpty) {
-
-      developer.log('WebSocket message without roomId, ignoring', name: 'MessageriePage');
-
-      return;
-
-    }
-
-    developer.log(
-
-        'WebSocket message received: roomId=$roomId, author=$authorUsername, text=${messageText.length > 50 ? "${messageText.substring(0, 50)}..." : messageText}',
-
-        name: 'MessageriePage'
-
-    );
-
-    // Trouver la conversation correspondante
-    final conversationIndex = conversations.indexWhere(
-
-            (c) => c['room_id']?.toString() == roomId.toString()
-
-    );
-
-    if (conversationIndex >= 0) {
-
-      // Mettre à jour la conversation existante
-      if (mounted) {
-
-        setState(() {
-
-          final timestamp = DateTime.tryParse(messageTimestamp) ?? DateTime.now();
-
-          // Préserver toutes les données existantes de la conversation
-          final existingConversation = conversations[conversationIndex];
-
-          conversations[conversationIndex] = {
-
-            ...existingConversation,
-
-            'message': messageText.isNotEmpty ? messageText : (existingConversation['message'] ?? 'Aucun message'),
-
-            'time': _formatConversationTime(messageTimestamp),
-
-            'last_date': messageTimestamp,
-
-            // Préserver les autres champs importants
-            'username': existingConversation['username'] ?? authorUsername,
-            'name': existingConversation['name'] ?? authorName,
-            'avatar_url': existingConversation['avatar_url'] ?? '',
-            'status': existingConversation['status'] ?? 'offline',
-            'type': existingConversation['type'] ?? 'private',
-            'unread': existingConversation['unread'] ?? false,
-
-          };
-
-          // Trier les conversations par date (plus récent en premier)
-          _sortConversationsByLastDate(conversations);
-
-          // Mettre à jour filteredConversations en préservant le tri
-          if (_searchController.text.trim().isEmpty) {
-            filteredConversations = List.from(conversations);
-          } else {
-            // Si on est en mode recherche, filtrer à nouveau
-            _filterConversations();
-          }
-
-          // Mettre à jour les contacts actifs si nécessaire
-          final activeContactIndex = activeContacts.indexWhere(
-
-                  (c) => c['id']?.toString() == roomId.toString()
-
-          );
-
-          if (activeContactIndex >= 0) {
-
-            // Mettre à jour le contact actif en préservant l'avatar
-            activeContacts[activeContactIndex] = {
-
-              ...activeContacts[activeContactIndex],
-
-              // Garder l'avatar_url existant pour éviter le rechargement
-              'status': existingConversation['status'] ?? activeContacts[activeContactIndex]['status'] ?? 'offline',
-
-            };
-
-          } else {
-
-            // Si le contact n'est pas dans la liste des actifs mais qu'il a envoyé un message,
-            // on pourrait l'ajouter, mais pour l'instant on ne fait rien
-            // car la liste des contacts actifs est gérée par l'API /api/chat/most_active_users
-
-          }
-
-        });
-
-      }
-
-    } else {
-
-      // Nouvelle conversation - rafraîchir la liste complète
-      developer.log('New conversation detected (roomId: $roomId), refreshing list', name: 'MessageriePage');
-
-      // Rafraîchir les conversations pour inclure la nouvelle
-      fetchConversations();
-
-    }
-
-  }
 
   @override
 
@@ -429,13 +188,9 @@ class _MessageriePageState extends State<MessageriePage>
 
     _tabController.dispose();
 
-    _wsMessageSubscription?.cancel();
-
-    _wsDeleteSubscription?.cancel();
-
-    _wsConnectionSubscription?.cancel();
-
     _connectionCheckTimer?.cancel();
+    
+    _refreshTimer?.cancel();
 
     developer.log('Disposing MessageriePage', name: 'MessageriePage');
 
@@ -443,6 +198,26 @@ class _MessageriePageState extends State<MessageriePage>
 
     super.dispose();
 
+  }
+  
+  /// Démarre un timer pour rafraîchir périodiquement la liste des conversations
+  void _startRefreshTimer() {
+    _refreshTimer?.cancel();
+    developer.log('🔄 Démarrage du polling pour les mises à jour en temps réel (toutes les 2 secondes)', name: 'MessageriePage');
+    _refreshTimer = Timer.periodic(const Duration(seconds: 2), (timer) {
+      if (!mounted) {
+        timer.cancel();
+        developer.log('⏹️ Arrêt du polling (widget non monté)', name: 'MessageriePage');
+        return;
+      }
+      // Rafraîchir silencieusement la liste des conversations pour s'assurer que les mises à jour sont visibles
+      developer.log('🔄 Polling: Rafraîchissement de la liste des conversations...', name: 'MessageriePage');
+      fetchConversations().then((_) {
+        developer.log('✅ Polling: Liste des conversations rafraîchie (${conversations.length} conversations)', name: 'MessageriePage');
+      }).catchError((error) {
+        developer.log('❌ Polling: Erreur lors du rafraîchissement: $error', name: 'MessageriePage');
+      });
+    });
   }
 
   Future<void> _checkAuthAndFetchData() async {
@@ -585,38 +360,53 @@ class _MessageriePageState extends State<MessageriePage>
 
       developer.log(
 
-        'fetchConversations: reçu ${data.length} utilisateurs depuis /api/chat/list-users',
+        '📥 fetchConversations: reçu ${data.length} utilisateurs depuis /api/chat/list-users (currentUser=$currentUser)',
 
         name: 'MessageriePage',
 
       );
 
+      // Stocker l'ancien état pour détecter les changements
+      final oldConversations = Map<String, Map<String, dynamic>>.fromEntries(
+        conversations.map((c) => MapEntry(c['room_id']?.toString() ?? '', c))
+      );
+      
       final List<Map<String, dynamic>> users = data.map((user) {
-
-        developer.log(
-
-          'fetchConversations: user brut => id=${user['id']} '
-
-              'username=${user['username']} '
-
-              'avatar=${user['avatar']} '
-
-              'avatar_url=${user['avatar_url']}',
-
-          name: 'MessageriePage',
-
-        );
 
         final date = DateTime.tryParse(user['last_date'] ?? '') ?? DateTime.now();
 
         final username = user['username']?.toString() ?? '';
 
         final status = user['status']?.toString() ?? 'offline';
+        
+        final roomId = user['room_id']?.toString() ?? '';
+        final lastMessage = user['last_message']?.toString() ?? '';
+        final lastDate = user['last_date']?.toString() ?? '';
 
         if (username.isNotEmpty) {
 
           _userStatusMap[username] = status;
 
+        }
+        
+        // Détecter si c'est un nouveau message (comparer avec l'ancien état)
+        final oldConversation = oldConversations[roomId];
+        final oldLastDate = oldConversation?['last_date']?.toString() ?? '';
+        final oldLastMessage = oldConversation?['message']?.toString() ?? '';
+        final isNewMessage = oldConversation != null && 
+                            (oldLastDate != lastDate || oldLastMessage != lastMessage);
+        final wasUnread = oldConversation?['unread'] == true;
+        
+        // Marquer comme non lu si :
+        // 1. C'est un nouveau message ET l'auteur n'est pas l'utilisateur actuel
+        // 2. OU c'était déjà marqué comme non lu
+        final shouldBeUnread = (isNewMessage && username != currentUser) || wasUnread;
+        
+        if (isNewMessage) {
+          developer.log(
+            '📨 Nouveau message détecté pour roomId=$roomId, username=$username (currentUser=$currentUser), lastMessage=${lastMessage.length > 30 ? "${lastMessage.substring(0, 30)}..." : lastMessage}, oldDate=$oldLastDate, newDate=$lastDate, unread=$shouldBeUnread',
+            name: 'MessageriePage',
+          );
         }
 
         return {
@@ -635,17 +425,17 @@ class _MessageriePageState extends State<MessageriePage>
 
           'status': status,
 
-          'message': user['last_message']?.toString() ?? '',
+          'message': lastMessage,
 
-          'time': _formatConversationTime(user['last_date'] ?? ''),
+          'time': _formatConversationTime(lastDate),
 
-          'last_date': user['last_date']?.toString() ?? '',
+          'last_date': lastDate,
 
-          'room_id': user['room_id']?.toString() ?? '',
+          'room_id': roomId,
 
           'type': 'private',
 
-          'unread': false,
+          'unread': shouldBeUnread,
 
         };
 
@@ -654,6 +444,12 @@ class _MessageriePageState extends State<MessageriePage>
       // Trier les conversations par last_date (plus récent en premier)
 
       _sortConversationsByLastDate(users);
+      
+      final unreadCount = users.where((u) => u['unread'] == true).length;
+      developer.log(
+        '✅ fetchConversations terminé: ${users.length} conversations, $unreadCount non lues',
+        name: 'MessageriePage',
+      );
 
       setState(() {
 
@@ -686,11 +482,7 @@ class _MessageriePageState extends State<MessageriePage>
             isConnectionError = true;
           }
         });
-        // Ne pas afficher de snackbar pour les erreurs de connexion
-        if (!isNetworkError) {
-          ScaffoldMessenger.of(context)
-              .showSnackBar(SnackBar(content: Text('Erreur : $e')));
-        }
+        // Erreur silencieuse
       }
 
     }
@@ -1355,7 +1147,9 @@ class _MessageriePageState extends State<MessageriePage>
 
             ),
 
-
+            actions: [
+              const NotificationIconButton(),
+            ],
 
             bottom: TabBar(
 
@@ -1560,23 +1354,36 @@ class _MessageriePageState extends State<MessageriePage>
 
                         avatarSvgCache: _avatarSvgCache,
 
-                        onContactTap: (contact) => Navigator.pushNamed(
-
+                        onContactTap: (contact) async {
+                          // Marquer la conversation comme lue avant d'ouvrir le chat
+                          final roomId = contact['id']?.toString();
+                          if (roomId != null) {
+                            setState(() {
+                              final conversationIndex = conversations.indexWhere(
+                                (conv) => conv['room_id']?.toString() == roomId,
+                              );
+                              if (conversationIndex >= 0 && conversations[conversationIndex]['unread'] == true) {
+                                conversations[conversationIndex]['unread'] = false;
+                                filteredConversations = List.from(conversations);
+                              }
+                            });
+                          }
+                          
+                          await Navigator.pushNamed(
                           context,
-
                           '/chat',
-
                           arguments: {
-
                             'room_id': contact['id'],
-
                             'name': contact['name'],
-
                             'avatar_url': contact['avatar_url'],
+                            },
+                          );
 
+                          // Rafraîchir la liste après le retour
+                          if (mounted) {
+                            fetchConversations();
+                          }
                           },
-
-                        ),
 
                       ),
 
@@ -1710,23 +1517,37 @@ class _MessageriePageState extends State<MessageriePage>
 
           child: ListTile(
 
-            onTap: () => Navigator.pushNamed(
-
+            onTap: () async {
+              // Marquer la conversation comme lue avant d'ouvrir le chat
+              final roomId = c['room_id']?.toString();
+              if (roomId != null && c['unread'] == true) {
+                setState(() {
+                  final conversationIndex = conversations.indexWhere(
+                    (conv) => conv['room_id']?.toString() == roomId,
+                  );
+                  if (conversationIndex >= 0) {
+                    conversations[conversationIndex]['unread'] = false;
+                    filteredConversations = List.from(conversations);
+                  }
+                });
+              }
+              
+              // Ouvrir le chat et attendre le retour
+              await Navigator.pushNamed(
               context,
-
               '/chat',
-
               arguments: {
-
                 'room_id': c['room_id'],
-
                 'name': c['name'],
-
                 'avatar_url': c['avatar_url'],
+                },
+              );
 
+              // Rafraîchir la liste après le retour pour s'assurer que tout est à jour
+              if (mounted) {
+                fetchConversations();
+              }
               },
-
-            ),
 
             leading: Stack(
 
@@ -1840,61 +1661,60 @@ class _MessageriePageState extends State<MessageriePage>
 
                     if (isSvg) {
 
-                      developer.log(
+                      // Utiliser le cache directement si disponible
+                      final cacheKey = username.isNotEmpty ? username : avatarUrl;
+                      if (_avatarSvgCache.containsKey(cacheKey)) {
+                        final cached = _avatarSvgCache[cacheKey]!;
+                        return CircleAvatar(
 
-                        'Conversation avatar: URL semble être un SVG pour $username -> $avatarUrl',
+                          backgroundColor: cached['color'] as Color,
 
-                        name: 'MessageriePage',
+                          child: Text(
 
-                      );
+                            cached['initial'] as String,
 
-                      return FutureBuilder<String?>(
+                            style: const TextStyle(
 
-                        future: _fetchAndSanitizeSvg(
+                              fontSize: 22,
 
-                          avatarUrl,
+                              fontWeight: FontWeight.bold,
 
-                          username,
+                              color: Colors.white,
 
-                        ),
+                            ),
+
+                          ),
+
+                        );
+                      }
+                      
+                      // Si pas dans le cache, utiliser le future cache pour éviter les rechargements
+                      if (!_avatarFutures.containsKey(cacheKey)) {
+                        _avatarFutures[cacheKey] = _loadAndCacheSvg(avatarUrl, cacheKey);
+                      }
+                      
+                      return FutureBuilder<Map<String, dynamic>>(
+
+                        future: _avatarFutures[cacheKey],
 
                         builder: (context, snapshot) {
 
-                          if (snapshot.connectionState ==
+                          if (snapshot.connectionState == ConnectionState.waiting) {
 
-                              ConnectionState.waiting) {
+                            // Ne pas afficher de loader, juste un placeholder discret
+                            return Container(
 
-                            return const Center(
+                              width: 48,
 
-                              child: SizedBox(
+                              height: 48,
 
-                                width: 24,
-
-                                height: 24,
-
-                                child: CircularProgressIndicator(
-
-                                  strokeWidth: 2,
-
-                                ),
-
-                              ),
+                              color: isDark ? Colors.grey[800] : Colors.grey[300],
 
                             );
 
                           }
 
-                          final svgData = snapshot.data;
-
-                          if (svgData == null || svgData.isEmpty) {
-
-                            developer.log(
-
-                              'Conversation avatar: SVG vide ou nul pour $username',
-
-                              name: 'MessageriePage',
-
-                            );
+                          if (snapshot.hasError || !snapshot.hasData) {
 
                             return Icon(
 
@@ -1906,23 +1726,11 @@ class _MessageriePageState extends State<MessageriePage>
 
                           }
 
-                          final avatarStyle =
-
-                          _extractAvatarStyleFromSvg(svgData);
+                          final avatarStyle = snapshot.data!;
 
                           final bgColor = avatarStyle['color'] as Color;
 
-                          final initial =
-
-                              (avatarStyle['initial'] as String?) ?? '?';
-
-                          developer.log(
-
-                            'Conversation avatar: SVG parsé pour $username -> couleur=$bgColor, initial=$initial',
-
-                            name: 'MessageriePage',
-
-                          );
+                          final initial = avatarStyle['initial'] as String;
 
                           return CircleAvatar(
 
@@ -1960,13 +1768,12 @@ class _MessageriePageState extends State<MessageriePage>
 
                     );
 
-                    // PNG/JPG classique
-
+                    // PNG/JPG classique - Utiliser CachedNetworkImage avec cache agressif
                     return ClipOval(
 
-                      child: Image.network(
+                      child: CachedNetworkImage(
 
-                        avatarUrl,
+                        imageUrl: avatarUrl,
 
                         fit: BoxFit.cover,
 
@@ -1974,11 +1781,39 @@ class _MessageriePageState extends State<MessageriePage>
 
                         height: 48,
 
-                        errorBuilder: (_, __, ___) {
+                        memCacheWidth: 96, // Optimisation mémoire
+
+                        memCacheHeight: 96,
+
+                        maxWidthDiskCache: 200, // Cache disque plus large
+
+                        maxHeightDiskCache: 200,
+
+                        cacheKey: avatarUrl, // Utiliser l'URL comme clé de cache
+
+                        useOldImageOnUrlChange: true, // Garder l'ancienne image si l'URL change
+
+                        fadeInDuration: const Duration(milliseconds: 0), // Pas d'animation de fade-in
+
+                        fadeOutDuration: const Duration(milliseconds: 0), // Pas d'animation de fade-out
+
+                        placeholder: (context, url) => Container(
+
+                          width: 48,
+
+                          height: 48,
+
+                          color: isDark ? Colors.grey[800] : Colors.grey[300],
+
+                          // Ne pas afficher de loader, juste un placeholder discret
+
+                        ),
+
+                        errorWidget: (context, url, error) {
 
                           developer.log(
 
-                            'Conversation avatar: ERREUR Image.network pour $username -> $avatarUrl',
+                            'Conversation avatar: ERREUR CachedNetworkImage pour $username -> $avatarUrl',
 
                             name: 'MessageriePage',
 
@@ -2061,6 +1896,8 @@ class _MessageriePageState extends State<MessageriePage>
               c['message'] ?? 'Aucun message',
 
               style: GoogleFonts.poppins(
+
+                fontWeight: c['unread'] == true ? FontWeight.bold : FontWeight.normal,
 
                 color: isDark ? Colors.white70 : Colors.grey[600],
 
@@ -2352,23 +2189,33 @@ class _MessageriePageState extends State<MessageriePage>
 
           _searchFocusNode.unfocus();
 
-          Navigator.pushNamed(
-
+          // Marquer la conversation comme lue avant d'ouvrir le chat
+          if (roomId.isNotEmpty) {
+            setState(() {
+              final conversationIndex = conversations.indexWhere(
+                (conv) => conv['room_id']?.toString() == roomId,
+              );
+              if (conversationIndex >= 0 && conversations[conversationIndex]['unread'] == true) {
+                conversations[conversationIndex]['unread'] = false;
+                filteredConversations = List.from(conversations);
+              }
+            });
+          }
+          
+          await Navigator.pushNamed(
             context,
-
             '/chat',
-
             arguments: {
-
               'room_id': roomId,
-
               'name': name,
-
               'avatar_url': avatar,
-
             },
-
           );
+          
+          // Rafraîchir la liste après le retour
+          if (mounted) {
+            fetchConversations();
+          }
 
         } else {
 
@@ -2414,6 +2261,36 @@ class _MessageriePageState extends State<MessageriePage>
 
     }
 
+  }
+  
+  /// Charge et met en cache un SVG avatar
+  Future<Map<String, dynamic>> _loadAndCacheSvg(
+      String avatarUrl, String username) async {
+    try {
+      // Vérifier d'abord le cache pour éviter les rechargements
+      final cacheKey = username.isNotEmpty ? username : avatarUrl;
+      if (_avatarSvgCache.containsKey(cacheKey)) {
+        return _avatarSvgCache[cacheKey]!;
+      }
+
+      // Utiliser la fonction existante pour récupérer et nettoyer le SVG
+      final svgData = await _fetchAndSanitizeSvg(avatarUrl, username);
+      
+      if (svgData == null || svgData.isEmpty) {
+        return {'color': Colors.purple, 'initial': '?'};
+      }
+
+      // Extraire le style du SVG
+      final avatarStyle = _extractAvatarStyleFromSvg(svgData);
+      
+      // Mettre en cache pour éviter les rechargements
+      _avatarSvgCache[cacheKey] = avatarStyle;
+      
+      return avatarStyle;
+    } catch (e) {
+      developer.log('Error loading SVG avatar: $e', name: 'MessageriePage');
+      return {'color': Colors.purple, 'initial': '?'};
+    }
   }
 
 }
@@ -2676,12 +2553,35 @@ class _ActiveContactsListState extends State<_ActiveContactsList>
 
       }
 
+      // Vérifier d'abord le cache partagé pour éviter les rechargements
+      if (widget.avatarSvgCache.containsKey(username)) {
+        final cached = widget.avatarSvgCache[username]!;
+        return CircleAvatar(
+
+          backgroundColor: cached['color'] as Color,
+
+          child: Text(
+
+            cached['initial'] as String,
+
+            style: const TextStyle(
+
+              fontSize: 26,
+
+              fontWeight: FontWeight.bold,
+
+              color: Colors.white,
+
+            ),
+
+          ),
+
+        );
+      }
+
       // Charger et mettre en cache
-
       if (!_avatarFutures.containsKey(username)) {
-
-        _avatarFutures[username] = _loadAndCacheSvg(avatarUrl, username);
-
+        _avatarFutures[username] = _loadAndCacheSvgForActiveContacts(avatarUrl, username);
       }
 
       return FutureBuilder<Map<String, dynamic>>(
@@ -2692,9 +2592,14 @@ class _ActiveContactsListState extends State<_ActiveContactsList>
 
           if (snapshot.connectionState == ConnectionState.waiting) {
 
-            return const Center(
+            // Ne pas afficher de loader, juste un placeholder discret
+            return Container(
 
-              child: CircularProgressIndicator(strokeWidth: 2),
+              width: 70,
+
+              height: 70,
+
+              color: widget.isDark ? Colors.grey[800] : Colors.grey[300],
 
             );
 
@@ -2742,9 +2647,29 @@ class _ActiveContactsListState extends State<_ActiveContactsList>
 
       fit: BoxFit.cover,
 
-      placeholder: (context, url) => const Center(
+      memCacheWidth: 200,
 
-        child: CircularProgressIndicator(strokeWidth: 2),
+      memCacheHeight: 200,
+
+      maxWidthDiskCache: 200,
+
+      maxHeightDiskCache: 200,
+
+      cacheKey: avatarUrl,
+
+      useOldImageOnUrlChange: true,
+
+      fadeInDuration: const Duration(milliseconds: 0),
+
+      fadeOutDuration: const Duration(milliseconds: 0),
+
+      placeholder: (context, url) => Container(
+
+        width: 70,
+
+        height: 70,
+
+        color: widget.isDark ? Colors.grey[800] : Colors.grey[300],
 
       ),
 
@@ -2761,165 +2686,62 @@ class _ActiveContactsListState extends State<_ActiveContactsList>
     );
 
   }
-
-  Future<Map<String, dynamic>> _loadAndCacheSvg(
-
+  
+  /// Charge et met en cache un SVG avatar pour les contacts actifs
+  Future<Map<String, dynamic>> _loadAndCacheSvgForActiveContacts(
       String avatarUrl, String username) async {
-
     try {
+      // Vérifier d'abord le cache partagé
+      if (widget.avatarSvgCache.containsKey(username)) {
+        return widget.avatarSvgCache[username]!;
+      }
 
+      // Charger le SVG
       final response = await http
-
           .get(Uri.parse(avatarUrl))
-
           .timeout(const Duration(seconds: 15));
 
       if (response.statusCode != 200) {
-
         return {'color': Colors.purple, 'initial': '?'};
-
       }
 
       final contentType = response.headers['content-type'] ?? '';
-
       if (!contentType.contains('image/svg')) {
-
         return {'color': Colors.purple, 'initial': '?'};
-
       }
 
       var svg = response.body;
-
-      // Extraire viewBox
-
-      double? vbWidth;
-
-      double? vbHeight;
-
-      final viewBoxMatch = RegExp(r'viewBox="\s*([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s*"')
-
-          .firstMatch(svg);
-
-      if (viewBoxMatch != null && viewBoxMatch.groupCount == 4) {
-
-        try {
-
-          vbWidth = double.parse(viewBoxMatch.group(3)!);
-
-          vbHeight = double.parse(viewBoxMatch.group(4)!);
-
-        } catch (_) {
-
-          vbWidth = null;
-
-          vbHeight = null;
-
-        }
-
-      }
-
-      // Remplacer les pourcentages
-
-      if (vbWidth != null || vbHeight != null) {
-
-        svg = svg.replaceAllMapped(
-
-          RegExp(r'(width|height)="([\d.]+)%"'),
-
-              (m) {
-
-            final attr = m.group(1);
-
-            final percentStr = m.group(2);
-
-            if (attr == null || percentStr == null) return m.group(0) ?? '';
-
-            final p = double.tryParse(percentStr);
-
-            if (p == null) return m.group(0) ?? '';
-
-            if (attr == 'width' && vbWidth != null) {
-
-              final v = vbWidth * p / 100.0;
-
-              return 'width="$v"';
-
-            }
-
-            if (attr == 'height' && vbHeight != null) {
-
-              final v = vbHeight * p / 100.0;
-
-              return 'height="$v"';
-
-            }
-
-            return m.group(0) ?? '';
-
-          },
-
-        );
-
-      }
-
+      
       // Extraire couleur et initiale
-
-      final rectMatch =
-
-      RegExp(r'<rect[^>]*fill="([^"]+)"', caseSensitive: false)
-
-          .firstMatch(svg);
-
+      final rectMatch = RegExp(r'<rect[^>]*fill="([^"]+)"', caseSensitive: false).firstMatch(svg);
       final bgFill = rectMatch?.group(1) ?? '#6200EE';
-
-      final textMatch =
-
-      RegExp(r'<text[^>]*>([^<]+)</text>', caseSensitive: false)
-
-          .firstMatch(svg);
-
+      final textMatch = RegExp(r'<text[^>]*>([^<]+)</text>', caseSensitive: false).firstMatch(svg);
       final rawText = (textMatch?.group(1) ?? '').trim();
-
       final initial = rawText.isNotEmpty ? rawText[0].toUpperCase() : '?';
 
       // Convertir couleur hex en Color
-
       var value = bgFill.replaceAll('#', '').trim();
-
       if (value.length == 6) {
-
         value = 'FF$value';
-
       }
-
       Color bgColor = const Color(0xFF6200EE);
-
       if (value.length == 8) {
-
         bgColor = Color(int.parse(value, radix: 16));
-
       }
 
       final result = {
-
         'color': bgColor,
-
         'initial': initial,
-
       };
 
+      // Mettre en cache partagé
       widget.avatarSvgCache[username] = result;
 
       return result;
-
     } catch (e) {
-
-      developer.log('Error loading SVG avatar: $e', name: 'MessageriePage');
-
+      developer.log('Error loading SVG avatar for active contact: $e', name: 'MessageriePage');
       return {'color': Colors.purple, 'initial': '?'};
-
     }
-
   }
 
 }

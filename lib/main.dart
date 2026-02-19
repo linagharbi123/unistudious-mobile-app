@@ -2,7 +2,14 @@ import 'package:flutter/material.dart';
 import 'package:flutter_localizations/flutter_localizations.dart'; // Added for localization
 import 'package:responsive_framework/responsive_framework.dart';
 import 'package:provider/provider.dart';
-import 'package:shared_preferences/shared_preferences.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'dart:io' show Platform;
+import 'package:image_picker_android/image_picker_android.dart';
+import 'package:image_picker_platform_interface/image_picker_platform_interface.dart';
 
 import 'screens/welcome_page.dart';
 import 'screens/login_page.dart';
@@ -36,6 +43,8 @@ import 'screens/theme_customization_page.dart';
 import 'screens/chat_page.dart';
 import 'screens/groupes_page.dart';
 import 'screens/main_navigation_page.dart';
+import 'screens/qr_scanner_page.dart';
+import 'screens/parent_invitations_page.dart';
 import 'providers/theme_provider.dart';
 import 'models/user_model.dart';
 import 'models/bottom_navigation_provider.dart';
@@ -51,8 +60,586 @@ import 'screens/version_check_page.dart';
 import 'models/version_check_response.dart';
 import 'package:flutter/foundation.dart';
 
+// Instance de flutter_local_notifications pour afficher les notifications sur Android
+final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
+    FlutterLocalNotificationsPlugin();
+
+// Variable globale pour recharger les notifications lorsqu'une notification Firebase arrive
+Function()? _reloadNotificationsCallback;
+
+// Référence globale à AuthProvider pour recharger les notifications
+AuthProvider? _globalAuthProvider;
+
+// Clé globale pour le NavigatorState afin de naviguer depuis n'importe où
+final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
+
+// Fonction pour mapper les valeurs de redirect vers les vraies routes de l'application
+String _mapRedirectToRoute(String redirectPath) {
+  // Normaliser en minuscules pour la comparaison
+  String normalized = redirectPath.toLowerCase().trim();
+  
+  // Mapping des valeurs de redirect (texte envoyé par Firebase) vers les routes réelles
+  final Map<String, String> redirectMap = {
+    // Messagerie / messages privés
+    'message': '/messagerie',
+    'messages': '/messagerie',
+    'messagerie': '/messagerie',
+    'inbox': '/messagerie',
+    'private message': '/messagerie',
+
+    // Chat direct
+    'chat': '/chat',
+
+    // Dashboard / accueil
+    'dashboard': '/dashboard',
+    'home': '/dashboard',
+    'accueil': '/dashboard',
+
+    // Cours / cours en ligne
+    'cours': '/mes-cours',
+    'mes-cours': '/mes-cours',
+    'course': '/mes-cours',
+    'courses': '/mes-cours',
+    'online course': '/mes-cours',
+    'cours en ligne': '/mes-cours',
+    'meet': '/mes-cours',               // ton choix: meet -> cours en ligne
+
+    // Social / fil social
+    'social': '/fil-social',
+    'fil-social': '/fil-social',
+    'feed': '/fil-social',
+    'social feed': '/fil-social',
+
+    // Ressources
+    'ressources': '/ressources',
+    'resources': '/ressources',
+
+    // Profil
+    'profile': '/profile',
+    'profil': '/profile',
+
+    // Paramètres
+    'settings': '/parametres',
+    'parametres': '/parametres',
+
+    // Calendrier / rappels
+    'calendar': '/calendrier',
+    'calendrier': '/calendrier',
+    'reminder calendar': '/calendrier',
+    'calendar reminder': '/calendrier',
+
+    // Groupes
+    'group': '/groups',
+    'groups': '/groups',
+    'groupes': '/groups',
+    'group join': '/groups',
+    'join group': '/groups',
+    'group invitation': '/groups',
+
+    // Factures / paiements
+    'invoice': '/invoices',
+    'invoices': '/invoices',
+    'payment': '/invoices',
+    'payment successful': '/invoices',
+    'successful payment': '/invoices',
+    'paiement': '/invoices',
+
+    // Présences / attendance
+    'attendance': '/presences',
+    'presences': '/presences',
+    'presence': '/presences',
+
+    // Session / rejoindre une session
+    'session': '/join-session',
+    'session invitation': '/join-session',
+    'join session': '/join-session',
+    'rejoindre une session': '/join-session',
+    
+    // Cas spéciaux techniques (valeurs par défaut de Firebase pour Flutter)
+    // On les redirige vers la messagerie pour les notifications de message
+    'flutter_notification_click': '/messagerie',
+  };
+  
+  // Vérifier si c'est déjà une route complète (commence par /)
+  if (redirectPath.startsWith('/')) {
+    // Vérifier si la route existe dans le mapping (sans le /)
+    final routeWithoutSlash = redirectPath.substring(1).toLowerCase();
+    return redirectMap[routeWithoutSlash] ?? redirectPath;
+  }
+  
+  // Mapper la valeur normalisée
+  return redirectMap[normalized] ?? '/$redirectPath';
+}
+
+// Fonction pour naviguer vers une route spécifique basée sur le paramètre redirect
+void _navigateToRoute(String? redirectPath) {
+  if (redirectPath == null || redirectPath.isEmpty) {
+    if (kDebugMode) {
+      print('⚠️ Aucun chemin de redirection fourni');
+    }
+    return;
+  }
+
+  // Mapper le redirect vers la vraie route
+  String route = _mapRedirectToRoute(redirectPath);
+
+  if (kDebugMode) {
+    print('📍 Redirect original: $redirectPath');
+    print('📍 Route mappée: $route');
+  }
+
+  final navigator = navigatorKey.currentState;
+  if (navigator == null) {
+    if (kDebugMode) {
+      print('⚠️ NavigatorState non disponible, attente...');
+    }
+    // Attendre que le Navigator soit disponible
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _navigateToRoute(redirectPath);
+    });
+    return;
+  }
+
+  try {
+    // Vérifier si la route est une route de la bottom bar
+    if (route == '/dashboard' || route == '/mes-cours' || route == '/fil-social' ||
+        route == '/ressources' || route == '/profile') {
+      final context = navigator.context;
+      final provider = Provider.of<BottomNavigationProvider>(context, listen: false);
+      const routeToIndexMap = {
+        '/dashboard': 0,
+        '/mes-cours': 1,
+        '/fil-social': 2,
+        '/ressources': 3,
+        '/profile': 4,
+      };
+      provider.updateIndex(routeToIndexMap[route] ?? 0);
+      navigator.pushNamedAndRemoveUntil(
+        route,
+        (route) => false,
+      );
+    } else {
+      // Pour les autres routes, navigation normale
+      navigator.pushNamedAndRemoveUntil(
+        route,
+        (route) => false,
+      );
+    }
+    if (kDebugMode) {
+      print('✅ Navigation réussie vers: $route');
+    }
+  } catch (e) {
+    if (kDebugMode) {
+      print('❌ Erreur lors de la navigation vers $route: $e');
+    }
+  }
+}
+
+// Initialiser flutter_local_notifications pour Android
+Future<void> _initializeLocalNotifications() async {
+  if (!Platform.isAndroid) return;
+
+  const AndroidInitializationSettings initializationSettingsAndroid =
+      AndroidInitializationSettings('@mipmap/ic_launcher');
+
+  const InitializationSettings initializationSettings = InitializationSettings(
+    android: initializationSettingsAndroid,
+  );
+
+  await flutterLocalNotificationsPlugin.initialize(
+    initializationSettings,
+    onDidReceiveNotificationResponse: (NotificationResponse response) {
+      if (kDebugMode) {
+        print('📱 Notification cliquée: ${response.payload}');
+      }
+    },
+  );
+
+  // Créer le canal de notification pour Android
+  const AndroidNotificationChannel channel = AndroidNotificationChannel(
+    'unistudious_notifications', // id
+    'Notifications', // name
+    description: 'Notifications pour Unistudious',
+    importance: Importance.high,
+  );
+
+  await flutterLocalNotificationsPlugin
+      .resolvePlatformSpecificImplementation<
+          AndroidFlutterLocalNotificationsPlugin>()
+      ?.createNotificationChannel(channel);
+
+  if (kDebugMode) {
+    print('✅ flutter_local_notifications initialisé pour Android');
+  }
+}
+
+// Handler pour les messages en background (quand l'app est fermée ou en background)
+Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
+  await Firebase.initializeApp();
+  if (kDebugMode) {
+    final platform = Platform.isIOS ? '🍎 iOS' : (Platform.isAndroid ? '🤖 Android' : '❓ Unknown');
+    print('═══════════════════════════════════════════════════════');
+    print('📨 MESSAGE REÇU EN BACKGROUND (Flutter)');
+    print('   Plateforme: $platform');
+    print('═══════════════════════════════════════════════════════');
+    print('Message ID: ${message.messageId}');
+    print('From: ${message.from}');
+    print('Sent Time: ${message.sentTime}');
+    print('');
+    print('--- NOTIFICATION ---');
+    if (message.notification != null) {
+      print('  Title: ${message.notification?.title}');
+      print('  Body: ${message.notification?.body}');
+    } else {
+      print('  ⚠️ Aucune notification');
+    }
+    print('');
+    print('--- DATA ---');
+    if (message.data.isNotEmpty) {
+      print('  Nombre de données: ${message.data.length}');
+      message.data.forEach((key, value) {
+        print('  $key: $value');
+      });
+    } else {
+      print('  ⚠️ Aucune donnée');
+    }
+    print('═══════════════════════════════════════════════════════');
+  }
+}
+
+// Afficher une notification locale sur Android
+Future<void> _showLocalNotification(String title, String body) async {
+  if (!Platform.isAndroid) return;
+
+  try {
+    const AndroidNotificationDetails androidPlatformChannelSpecifics =
+        AndroidNotificationDetails(
+      'unistudious_notifications',
+      'Notifications',
+      channelDescription: 'Notifications pour Unistudious',
+      importance: Importance.high,
+      priority: Priority.high,
+      showWhen: true,
+    );
+
+    const NotificationDetails platformChannelSpecifics =
+        NotificationDetails(android: androidPlatformChannelSpecifics);
+
+    await flutterLocalNotificationsPlugin.show(
+      DateTime.now().millisecondsSinceEpoch.remainder(100000),
+      title,
+      body,
+      platformChannelSpecifics,
+    );
+
+    if (kDebugMode) {
+      print('✅ Notification locale affichée sur Android');
+      print('   Title: $title');
+      print('   Body: $body');
+    }
+  } catch (e) {
+    if (kDebugMode) {
+      print('❌ Erreur lors de l\'affichage de la notification locale: $e');
+    }
+  }
+}
+
+// Fonction pour recharger les notifications immédiatement
+void _reloadNotifications() {
+  final notificationsProvider = NotificationsListProvider.instance;
+  if (notificationsProvider != null && _globalAuthProvider != null) {
+    if (_globalAuthProvider!.isLoggedIn && _globalAuthProvider!.currentToken != null) {
+      if (kDebugMode) {
+        print('🔄 Mise à jour IMMÉDIATE du nombre de notifications depuis Firebase...');
+      }
+      // Utiliser la nouvelle API de comptage qui est plus efficace
+      // Ne pas attendre le résultat pour être plus rapide
+      notificationsProvider.updateNotificationCount(_globalAuthProvider).catchError((error) {
+        if (kDebugMode) {
+          print('❌ Erreur lors de la mise à jour immédiate: $error');
+        }
+      });
+    }
+  } else if (_reloadNotificationsCallback != null) {
+    // Fallback vers le callback si disponible
+    _reloadNotificationsCallback!();
+  } else {
+    if (kDebugMode) {
+      print('⚠️ Impossible de recharger les notifications: provider=${notificationsProvider != null}, authProvider=${_globalAuthProvider != null}');
+    }
+  }
+}
+
+// Configuration des handlers Firebase Messaging
+void _setupFirebaseMessaging() {
+  final messaging = FirebaseMessaging.instance;
+  
+  // Handler pour les messages en foreground
+  FirebaseMessaging.onMessage.listen((RemoteMessage message) {
+    // Recharger les notifications IMMÉDIATEMENT lorsqu'une notification arrive
+    // Appeler plusieurs fois pour s'assurer que ça fonctionne
+    _reloadNotifications();
+    // Attendre un court délai et recharger à nouveau pour être sûr
+    Future.delayed(const Duration(milliseconds: 500), () {
+      _reloadNotifications();
+    });
+    
+    if (kDebugMode) {
+      final platform = Platform.isIOS ? '🍎 iOS' : (Platform.isAndroid ? '🤖 Android' : '❓ Unknown');
+      print('═══════════════════════════════════════════════════════');
+      print('📨 NOTIFICATION REÇUE EN FOREGROUND (Flutter)');
+      print('   Plateforme: $platform');
+      print('═══════════════════════════════════════════════════════');
+      print('Message ID: ${message.messageId}');
+      print('From: ${message.from}');
+      print('Sent Time: ${message.sentTime}');
+      print('Message Type: ${message.messageType}');
+      print('Collapse Key: ${message.collapseKey}');
+      print('Ttl: ${message.ttl}');
+      print('');
+      print('--- NOTIFICATION ---');
+      if (message.notification != null) {
+        print('  ✅ Notification présente');
+        print('  Title: ${message.notification?.title}');
+        print('  Body: ${message.notification?.body}');
+        if (Platform.isIOS) {
+          print('  🍎 iOS: La notification sera affichée par iOS');
+        } else if (Platform.isAndroid) {
+          print('  🤖 Android: La notification sera affichée par le service Android');
+        }
+      } else {
+        print('  ⚠️ Aucune notification dans le message');
+      }
+      print('');
+      print('--- DATA ---');
+      if (message.data.isNotEmpty) {
+        print('  ✅ Données présentes: ${message.data.length} élément(s)');
+        message.data.forEach((key, value) {
+          print('  $key: $value');
+        });
+      } else {
+        print('  ⚠️ Aucune donnée dans le message');
+      }
+      print('');
+      print('--- DIAGNOSTIC ---');
+      print('  Plateforme: $platform');
+      print('  Notification null: ${message.notification == null}');
+      print('  Data empty: ${message.data.isEmpty}');
+      print('  Message complet: ${message.toString()}');
+      
+      if (message.notification == null && message.data.isEmpty) {
+        print('');
+        print('⚠️ PROBLÈME DÉTECTÉ: Message reçu mais vide!');
+        print('   Cela signifie que le message depuis le web est mal formaté.');
+        print('   Le message doit contenir soit:');
+        print('   - Un champ "notification" avec "title" et "body"');
+        print('   - Ou un champ "data" avec au moins "title" et "body"');
+        print('');
+        print('⚠️ Sur Android, le service natif devrait être appelé mais ne l\'est pas.');
+        print('   Cela indique que Flutter intercepte le message avant le service natif.');
+      } else if (message.notification != null) {
+        print('');
+        print('✅ Message valide avec notification');
+        if (Platform.isIOS) {
+          print('   Sur iOS, la notification sera affichée automatiquement');
+        } else if (Platform.isAndroid) {
+          print('   🤖 Android: Affichage manuel de la notification avec flutter_local_notifications');
+          // Afficher la notification manuellement sur Android
+          _showLocalNotification(
+            message.notification!.title ?? 'Notification',
+            message.notification!.body ?? '',
+          );
+        }
+      } else if (message.data.isNotEmpty) {
+        print('');
+        print('✅ Message data-only détecté');
+        print('   Le service Android/iOS devrait créer une notification');
+        // Essayer d'extraire title et body des données
+        if (Platform.isAndroid) {
+          final title = message.data['title'] ?? 
+                       message.data['notification.title'] ?? 
+                       message.data['notification_title'] ?? 
+                       'Notification';
+          final body = message.data['body'] ?? 
+                      message.data['message'] ?? 
+                      message.data['notification.body'] ?? 
+                      message.data['notification_body'] ?? 
+                      message.data['text'] ?? 
+                      'Nouvelle notification';
+          _showLocalNotification(title, body);
+        }
+      }
+      print('═══════════════════════════════════════════════════════');
+      print('');
+    }
+  });
+  
+  // Handler pour les messages en background
+  FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
+  
+  // Handler pour les notifications ouvertes (quand l'utilisateur clique dessus)
+  FirebaseMessaging.onMessageOpenedApp.listen((RemoteMessage message) {
+    // Recharger immédiatement les notifications quand l'utilisateur ouvre une notification
+    _reloadNotifications();
+    if (kDebugMode) {
+      final platform = Platform.isIOS ? '🍎 iOS' : (Platform.isAndroid ? '🤖 Android' : '❓ Unknown');
+      print('═══════════════════════════════════════════════════════');
+      print('📱 NOTIFICATION OUVERTE PAR L\'UTILISATEUR');
+      print('   Plateforme: $platform');
+      print('═══════════════════════════════════════════════════════');
+      print('Message ID: ${message.messageId}');
+      print('From: ${message.from}');
+      print('--- NOTIFICATION ---');
+      print('  Title: ${message.notification?.title}');
+      print('  Body: ${message.notification?.body}');
+      print('--- DATA ---');
+      if (message.data.isNotEmpty) {
+        message.data.forEach((key, value) {
+          print('  $key: $value');
+        });
+      } else {
+        print('  Aucune donnée');
+      }
+      print('═══════════════════════════════════════════════════════');
+    }
+    
+    // Extraire le paramètre redirect/location et naviguer vers la page spécifique
+    // Vérifier d'abord dans les données, puis dans l'action (pour iOS)
+    final redirectPath = message.data['redirect'] 
+        ?? message.data['location'] 
+        ?? message.data['route']
+        ?? message.data['action'];  // Certains services utilisent 'action' au lieu de 'click_action'
+    if (redirectPath != null) {
+      if (kDebugMode) {
+        print('📍 Paramètre redirect trouvé dans les données: $redirectPath');
+      }
+      _navigateToRoute(redirectPath);
+    } else {
+      if (kDebugMode) {
+        print('⚠️ Aucun paramètre redirect/location trouvé dans les données');
+        print('   Note: Sur Android, le clickAction est géré via le canal de méthode native');
+      }
+    }
+  });
+  
+  // Vérifier si l'app a été ouverte depuis une notification
+  messaging.getInitialMessage().then((RemoteMessage? message) {
+    // Recharger les notifications si l'app a été ouverte depuis une notification
+    if (message != null) {
+      _reloadNotifications();
+      if (kDebugMode) {
+        final platform = Platform.isIOS ? '🍎 iOS' : (Platform.isAndroid ? '🤖 Android' : '❓ Unknown');
+        print('═══════════════════════════════════════════════════════');
+        print('📱 APP OUVERTE DEPUIS UNE NOTIFICATION');
+        print('   Plateforme: $platform');
+        print('═══════════════════════════════════════════════════════');
+        print('Message ID: ${message.messageId}');
+        print('From: ${message.from}');
+      print('--- NOTIFICATION ---');
+      print('  Title: ${message.notification?.title}');
+      print('  Body: ${message.notification?.body}');
+      print('--- DATA ---');
+      if (message.data.isNotEmpty) {
+        message.data.forEach((key, value) {
+          print('  $key: $value');
+        });
+      } else {
+        print('  Aucune donnée');
+      }
+      print('═══════════════════════════════════════════════════════');
+      }
+      
+      // Extraire le paramètre redirect/location et naviguer vers la page spécifique
+      // Vérifier d'abord dans les données, puis dans l'action
+      final redirectPath = message.data['redirect'] 
+          ?? message.data['location'] 
+          ?? message.data['route']
+          ?? message.data['action'];  // Certains services utilisent 'action'
+      if (redirectPath != null) {
+        if (kDebugMode) {
+          print('📍 Paramètre redirect trouvé dans les données: $redirectPath');
+        }
+        // Attendre que l'app soit complètement initialisée avant de naviguer
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          Future.delayed(const Duration(milliseconds: 500), () {
+            _navigateToRoute(redirectPath);
+          });
+        });
+      } else {
+        if (kDebugMode) {
+          print('⚠️ Aucun paramètre redirect/location trouvé dans les données');
+          print('   Note: Sur Android, le clickAction est géré via le canal de méthode native');
+        }
+      }
+    }
+  });
+  
+  if (kDebugMode) {
+    print('✅ Handlers Firebase Messaging configurés');
+  }
+  
+  // Configurer le canal de méthode pour recevoir les notifications depuis les plateformes natives
+  _setupNotificationChannel();
+}
+
+// Configurer le canal de méthode pour recevoir les notifications depuis Android/iOS
+void _setupNotificationChannel() {
+  const MethodChannel channel = MethodChannel('com.unistudious.projet1v2/notification');
+  
+  channel.setMethodCallHandler((call) async {
+    if (call.method == 'onNotificationOpened') {
+      final Map<dynamic, dynamic>? arguments = call.arguments as Map<dynamic, dynamic>?;
+      if (arguments != null) {
+        final redirectPath = arguments['redirect'] as String?;
+        if (kDebugMode) {
+          print('📱 Notification ouverte depuis plateforme native');
+          print('📍 Paramètre redirect reçu: $redirectPath');
+        }
+        if (redirectPath != null) {
+          // Attendre que l'app soit complètement initialisée
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            Future.delayed(const Duration(milliseconds: 500), () {
+              _navigateToRoute(redirectPath);
+            });
+          });
+        }
+      }
+    }
+  });
+  
+  if (kDebugMode) {
+    print('✅ Canal de méthode pour notifications configuré');
+  }
+}
+
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // Utiliser le Photo Picker Android (sans READ_MEDIA_IMAGES/VIDEO) pour conformité Google Play
+  if (Platform.isAndroid) {
+    final imagePickerImplementation = ImagePickerPlatform.instance;
+    if (imagePickerImplementation is ImagePickerAndroid) {
+      imagePickerImplementation.useAndroidPhotoPicker = true;
+    }
+  }
+
+  // Initialiser Firebase
+  try {
+    await Firebase.initializeApp();
+    if (kDebugMode) {
+      print('✅ Firebase initialisé avec succès');
+    }
+    
+    // Initialiser flutter_local_notifications pour Android
+    await _initializeLocalNotifications();
+    
+    // Configurer les handlers pour les notifications Firebase
+    _setupFirebaseMessaging();
+  } catch (e) {
+    if (kDebugMode) {
+      print('❌ Erreur lors de l\'initialisation de Firebase: $e');
+    }
+  }
 
   // Initialiser AppConfig pour récupérer la plateforme et la version
   await AppConfig.initialize();
@@ -60,13 +647,16 @@ void main() async {
   final themeProvider = ThemeProvider();
   await themeProvider.loadTheme();
 
+  final authProvider = AuthProvider();
+  _globalAuthProvider = authProvider;
+  
   runApp(
     MultiProvider(
       providers: [
         ChangeNotifierProvider(create: (_) => UserModel()),
         ChangeNotifierProvider(create: (_) => BottomNavigationProvider()),
         ChangeNotifierProvider(create: (_) => AppBarProvider()),
-        ChangeNotifierProvider(create: (_) => AuthProvider()),
+        ChangeNotifierProvider(create: (_) => authProvider),
         ChangeNotifierProvider(create: (_) => LoadingProvider()),
         ChangeNotifierProvider(create: (_) => themeProvider),
         ChangeNotifierProvider(create: (_) => NotificationsListProvider()),
@@ -226,6 +816,11 @@ class MyApp extends StatelessWidget {
 
       if (kDebugMode) {
         print('✅ Réponse API reçue - Status: ${response.status}, Updates: ${response.updates.length}');
+        // Afficher toutes les mises à jour reçues
+        for (var i = 0; i < response.updates.length; i++) {
+          final u = response.updates[i];
+          print('  📋 Update $i: Version=${u.version}, Required=${u.required}, Status=${u.status}');
+        }
       }
 
       if (!response.hasUpdate) {
@@ -235,6 +830,8 @@ class MyApp extends StatelessWidget {
         return null;
       }
 
+      // Sélectionner la mise à jour à afficher (uniquement parmi celles dans l'API)
+      // Ne pas utiliser de cache - utiliser uniquement les données de l'API
       final update = response.firstUpdate;
       if (update == null) {
         if (kDebugMode) {
@@ -244,30 +841,22 @@ class MyApp extends StatelessWidget {
       }
 
       if (kDebugMode) {
-        print('📦 Mise à jour trouvée - Version: ${update.version}, Required: ${update.required}');
+        print('📦 Mise à jour sélectionnée - Version: ${update.version}, Required: ${update.required}, Status: ${update.status}');
       }
 
       // Si la mise à jour est obligatoire, toujours l'afficher
       if (update.required) {
         if (kDebugMode) {
-          print('🔒 Mise à jour obligatoire détectée');
+          print('🔒 Mise à jour obligatoire détectée - Affichage obligatoire');
         }
         return update;
       }
 
-      // Si la mise à jour n'est pas obligatoire, vérifier si l'utilisateur l'a déjà skip
-      final prefs = await SharedPreferences.getInstance();
-      final skipped = prefs.getBool('skipped_version_${update.version}') ?? false;
-
-      if (skipped) {
-        if (kDebugMode) {
-          print('⏭️ Version ${update.version} déjà skip par l\'utilisateur');
-        }
-        return null;
-      }
-
+      // Si la mise à jour n'est pas obligatoire, l'afficher quand même
+      // L'utilisateur pourra la skip, mais on ne l'enregistre pas dans le cache
+      // Si elle n'est plus dans l'API la prochaine fois, elle ne s'affichera pas
       if (kDebugMode) {
-        print('✅ Affichage de la mise à jour optionnelle');
+        print('✅ Affichage de la mise à jour optionnelle (pas de cache utilisé)');
       }
       return update;
     } catch (e) {
@@ -284,6 +873,7 @@ class MyApp extends StatelessWidget {
     return Consumer<ThemeProvider>(
       builder: (context, themeProvider, child) {
         return MaterialApp(
+          navigatorKey: navigatorKey,
           debugShowCheckedModeBanner: false,
           title: 'Unistudious',
           themeMode: themeProvider.themeMode,
@@ -394,6 +984,12 @@ class MyApp extends StatelessWidget {
             ),
           ),
           builder: (context, child) {
+            // Mettre à jour la référence globale à AuthProvider si nécessaire
+            final authProvider = Provider.of<AuthProvider>(context, listen: false);
+            if (_globalAuthProvider != authProvider) {
+              _globalAuthProvider = authProvider;
+            }
+            
             final mq = MediaQuery.of(context);
             final clamped = mq.copyWith(textScaler: const TextScaler.linear(1.0));
             final wrappedChild = MediaQuery(data: clamped, child: child!);
@@ -496,6 +1092,8 @@ class MyApp extends StatelessWidget {
               provider.updateIndex(4);
               return const MainNavigationPage();
             },
+            '/qr-scanner': (context) => NavigationWrapper(child: const QRScannerPage(), currentRoute: '/qr-scanner'),
+            '/parent-invitations': (context) => NavigationWrapper(child: const ParentInvitationsPage(), currentRoute: '/parent-invitations'),
             '/parametres': (context) => NavigationWrapper(child: SettingsPage(), currentRoute: '/parametres'),
             '/favorites': (context) => NavigationWrapper(child: FavoritesPage(), currentRoute: '/favorites'),
             '/push_notifications': (context) => NavigationWrapper(child: PushNotificationProfilePage(), currentRoute: '/push_notifications'),

@@ -247,13 +247,13 @@ class _LoginPageState extends State<LoginPage> {
                     foregroundColor: isDark ? Colors.white : Colors.black87,
                     borderColor: isDark ? Colors.grey[600]! : Colors.grey[300]!,
                   ),
-                  _buildElevatedButton(
-                    onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => FacebookLoginPage())),
-                    label: 'Continuer avec Facebook',
-                    icon: Icons.facebook,
-                    backgroundColor: Color(0xFF1877F2),
-                    foregroundColor: Colors.white,
-                  ),
+                  //_buildElevatedButton(
+                    //onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => FacebookLoginPage())),
+                    //label: 'Continuer avec Facebook',
+                    //icon: Icons.facebook,
+                    //backgroundColor: Color(0xFF1877F2),
+                    //foregroundColor: Colors.white,
+                  //),
                   if (Platform.isIOS)
                     _buildElevatedButton(
                       onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => AppleLoginPage())),

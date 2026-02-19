@@ -51,57 +51,8 @@ class SnackBarHelper {
     String message, {
     Duration duration = const Duration(seconds: 4),
   }) {
-    // Détecter les erreurs de connexion et ne pas afficher de snackbar
-    final isNetworkError = message.contains('SocketException') ||
-                           message.contains('Failed host lookup') ||
-                           message.contains('Network is unreachable') ||
-                           message.contains('Connection refused') ||
-                           message.contains('Connection timed out') ||
-                           message.contains('No Internet connection') ||
-                           message.contains('ClientException') ||
-                           message.contains('OS Error') ||
-                           message.contains('nodename nor servname');
-    
-    // Ne pas afficher de snackbar pour les erreurs de connexion
-    if (isNetworkError) {
-      return;
-    }
-
-    final theme = Theme.of(context);
-    final isDark = theme.brightness == Brightness.dark;
-
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Row(
-          children: [
-            Icon(
-              Icons.error_outline,
-              color: Colors.white,
-              size: 24,
-            ),
-            SizedBox(width: 12),
-            Expanded(
-              child: Text(
-                message,
-                style: TextStyle(
-                  color: Colors.white,
-                  fontSize: 15,
-                  fontWeight: FontWeight.w500,
-                ),
-              ),
-            ),
-          ],
-        ),
-        backgroundColor: Colors.red.shade600,
-        behavior: SnackBarBehavior.floating,
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(12),
-        ),
-        margin: EdgeInsets.all(16),
-        elevation: 6,
-        duration: duration,
-      ),
-    );
+    // Désactivé : ne plus afficher de snackbar d'erreur
+    return;
   }
 
   /// Affiche une SnackBar d'information (bleue)

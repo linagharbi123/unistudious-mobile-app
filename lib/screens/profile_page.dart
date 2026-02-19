@@ -10,6 +10,7 @@ import '../models/user_model.dart';
 import '../providers/auth_provider.dart';
 import '../providers/theme_provider.dart';
 import '../utils/snackbar_helper.dart';
+import '../widgets/notification_icon_button.dart';
 
 class ProfilePage extends StatefulWidget {
   @override
@@ -391,6 +392,9 @@ class _ProfilePageState extends State<ProfilePage> {
             ),
           ),
         ),
+        actions: [
+          const NotificationIconButton(),
+        ],
       ),
       body: GestureDetector(
         onTap: () {

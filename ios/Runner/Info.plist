@@ -65,20 +65,28 @@
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsArbitraryLoads</key>
-		<true/>
+		<false/>
+		<key>NSExceptionDomains</key>
+		<dict>
+			<key>rocket.chat</key>
+			<dict>
+				<key>NSExceptionAllowsInsecureHTTPLoads</key>
+				<true/>
+				<key>NSIncludesSubdomains</key>
+				<true/>
+			</dict>
+		</dict>
 	</dict>
 	<key>NSCalendarsUsageDescription</key>
 	<string>Accès au calendrier requis pour planifier et afficher vos sessions et événements.</string>
 	<key>NSCameraUsageDescription</key>
-	<string>Accès à la caméra requis pour les réunions</string>
+	<string>Accès à la caméra requis pour les réunions et le scan de QR codes</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Accès au microphone requis pour les réunions</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
-	<string>We need access to add photos to your library.</string>
+	<string>Accès à la bibliothèque photo requis pour sauvegarder des images depuis l'application.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
-	<string>We need access to your photo library to upload images.</string>
-	<key>NSVideoSubscriberAccountUsageDescription</key>
-	<string>We need access to your video library to upload videos.</string>
+	<string>Accès à la bibliothèque photo requis pour sélectionner et télécharger des images et vidéos pour vos cours et messages.</string>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
 	<key>UIBackgroundModes</key>

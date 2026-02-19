@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:developer' as developer;
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:http/http.dart' as http;
@@ -26,10 +27,14 @@ class _AppSidebarState extends State<AppSidebar> {
   @override
   void initState() {
     super.initState();
+    // Charger immédiatement les données en cache et afficher le sidebar
+    _loadCachedDataAndShow();
+    // Charger les données à jour en arrière-plan
     _checkAuthAndFetchData();
   }
 
-  Future<void> _checkAuthAndFetchData() async {
+  // Charger les données en cache immédiatement pour afficher le sidebar rapidement
+  Future<void> _loadCachedDataAndShow() async {
     if (!mounted) return;
     try {
       final authProvider = Provider.of<AuthProvider>(context, listen: false);
@@ -45,33 +50,37 @@ class _AppSidebarState extends State<AppSidebar> {
         return;
       }
 
-      await _applyCachedUser();
-      unawaited(_fetchProfileData());
-      unawaited(_checkSessionStatus());
+      // Appliquer les données en cache immédiatement (sans attendre)
+      unawaited(_applyCachedUser());
+      
+      // Afficher le sidebar immédiatement sans attendre les appels API
       if (mounted) setState(() => _isLoading = false);
     } catch (e) {
       if (mounted) {
-        // Détecter les erreurs de connexion et ne pas afficher de snackbar
-        final isNetworkError = e is SocketException || 
-                               e.toString().contains('SocketException') ||
-                               e.toString().contains('Failed host lookup') ||
-                               e.toString().contains('Network is unreachable') ||
-                               e.toString().contains('Connection refused') ||
-                               e.toString().contains('Connection timed out') ||
-                               e.toString().contains('No Internet connection');
-        
         setState(() {
           _errorMessage = 'Erreur lors de la récupération du token : $e';
           _isLoading = false;
         });
-        
-        // Ne pas afficher de snackbar pour les erreurs de connexion
-        if (!isNetworkError) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text(_errorMessage!)),
-          );
-        }
       }
+    }
+  }
+
+  // Charger les données à jour en arrière-plan (sans bloquer l'affichage)
+  Future<void> _checkAuthAndFetchData() async {
+    if (!mounted) return;
+    try {
+      final authProvider = Provider.of<AuthProvider>(context, listen: false);
+
+      if (!authProvider.isLoggedIn) {
+        return;
+      }
+
+      // Charger les données à jour en arrière-plan sans bloquer l'UI
+      unawaited(_fetchProfileData());
+      unawaited(_checkSessionStatus());
+    } catch (e) {
+      // Erreurs silencieuses en arrière-plan
+      developer.log('Error in background data fetch: $e', name: 'AppSidebar');
     }
   }
 
@@ -161,40 +170,13 @@ class _AppSidebarState extends State<AppSidebar> {
             const SnackBar(content: Text('Session expirée. Veuillez vous reconnecter.')),
           );
           Navigator.pushReplacementNamed(context, '/login');
-        } else {
-          if (!mounted) return null;
-          // Ne pas afficher de snackbar pour les erreurs de connexion (gérées dans le catch)
-          // On laisse cette erreur s'afficher car c'est une erreur HTTP, pas une erreur de connexion
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text('Erreur lors du chargement de l\'image : ${response.statusCode}'),
-              action: SnackBarAction(label: 'Réessayer', onPressed: _fetchProfileData),
-            ),
-          );
         }
+        // Ne pas afficher de snackbar pour les autres erreurs (404, etc.)
         return null;
       }
     } catch (e) {
       if (!mounted) return null;
-      
-      // Détecter les erreurs de connexion et ne pas afficher de snackbar
-      final isNetworkError = e is SocketException || 
-                             e.toString().contains('SocketException') ||
-                             e.toString().contains('Failed host lookup') ||
-                             e.toString().contains('Network is unreachable') ||
-                             e.toString().contains('Connection refused') ||
-                             e.toString().contains('Connection timed out') ||
-                             e.toString().contains('No Internet connection');
-      
-      // Ne pas afficher de snackbar pour les erreurs de connexion
-      if (!isNetworkError) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Erreur lors du chargement de l\'image : $e'),
-            action: SnackBarAction(label: 'Réessayer', onPressed: _fetchProfileData),
-          ),
-        );
-      }
+      // Ne pas afficher de snackbar pour les erreurs de chargement d'image
       return null;
     }
   }
@@ -251,39 +233,19 @@ class _AppSidebarState extends State<AppSidebar> {
       } else {
         if (!mounted) return;
         final isAuth = response.statusCode == 401 || response.statusCode == 403;
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(isAuth
-                ? 'Session expirée. Veuillez vous reconnecter.'
-                : 'Erreur lors du chargement du profil : ${response.statusCode}'),
-            action: isAuth ? null : SnackBarAction(label: 'Réessayer', onPressed: _retryProfile),
-          ),
-        );
+        // Ne pas afficher de snackbar pour les erreurs de chargement du profil
+        // Seulement rediriger vers login si session expirée
         if (isAuth && mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Session expirée. Veuillez vous reconnecter.')),
+          );
           Navigator.pushReplacementNamed(context, '/login');
         }
       }
     } catch (e) {
       if (!mounted) return;
-      
-      // Détecter les erreurs de connexion et ne pas afficher de snackbar
-      final isNetworkError = e is SocketException || 
-                             e.toString().contains('SocketException') ||
-                             e.toString().contains('Failed host lookup') ||
-                             e.toString().contains('Network is unreachable') ||
-                             e.toString().contains('Connection refused') ||
-                             e.toString().contains('Connection timed out') ||
-                             e.toString().contains('No Internet connection');
-      
-      // Ne pas afficher de snackbar pour les erreurs de connexion
-      if (!isNetworkError) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Erreur lors de la récupération du profil : $e'),
-            action: SnackBarAction(label: 'Réessayer', onPressed: _retryProfile),
-          ),
-        );
-      }
+      // Ne pas afficher de snackbar pour les erreurs de récupération du profil
+      // Les erreurs sont silencieuses pour ne pas perturber l'utilisateur
     }
   }
 
@@ -416,6 +378,11 @@ class _AppSidebarState extends State<AppSidebar> {
                       if (_isLoading)
                         const Center(child: CircularProgressIndicator(color: Colors.deepPurple))
                       else if (Provider.of<AuthProvider>(context).isLoggedIn) ...[
+                        _UserProfileCard(
+                          name: userModel.name,
+                          imageUrl: userModel.imageUrl,
+                          theme: theme,
+                        ),
                         _SectionHeader('Principal', theme),
                         _SidebarTile(
                           icon: Icons.home_outlined,
@@ -475,6 +442,14 @@ class _AppSidebarState extends State<AppSidebar> {
                           theme: theme,
                           isActive: currentRoute == '/fil-social',
                         ),
+                        _SidebarTile(
+                          icon: Icons.family_restroom_outlined,
+                          label: 'Invitations Parents',
+                          color: color,
+                          onTap: () => _go('/parent-invitations'),
+                          theme: theme,
+                          isActive: currentRoute == '/parent-invitations',
+                        ),
                         if (userModel.hasActiveSession) ...[
                           _SectionHeader('Sessions', theme),
                           _SidebarTile(
@@ -519,6 +494,14 @@ class _AppSidebarState extends State<AppSidebar> {
                           ),
                         ],
                         _SectionHeader('Paramètres', theme),
+                        _SidebarTile(
+                          icon: Icons.qr_code_scanner_outlined,
+                          label: 'Scanner QR Code',
+                          color: color,
+                          onTap: () => _go('/qr-scanner'),
+                          theme: theme,
+                          isActive: currentRoute == '/qr-scanner',
+                        ),
                         _SidebarTile(
                           icon: Icons.settings_outlined,
                           label: 'Paramètres',
@@ -606,53 +589,6 @@ class _HeaderCard extends StatelessWidget {
             ),
           ),
         ),
-        const SizedBox(height: 8),
-        if (name.isNotEmpty || avatarProvider != null)
-          Container(
-            margin: const EdgeInsets.symmetric(horizontal: 25),
-            decoration: BoxDecoration(
-              color: theme.cardColor,
-              borderRadius: BorderRadius.circular(16),
-              boxShadow: [
-                BoxShadow(
-                  color: theme.shadowColor.withOpacity(0.2),
-                  blurRadius: 4,
-                  offset: const Offset(0, 2),
-                ),
-              ],
-            ),
-            padding: const EdgeInsets.all(10),
-            child: Row(
-              children: [
-                CircleAvatar(
-                  radius: 22,
-                  backgroundColor: theme.unselectedWidgetColor,
-                  backgroundImage: avatarProvider,
-                  child: avatarProvider == null
-                      ? Icon(Icons.person, color: theme.iconTheme.color)
-                      : null,
-                ),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        name.isNotEmpty ? name : 'Utilisateur',
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: GoogleFonts.poppins(
-                          color: theme.textTheme.bodyLarge?.color ?? Colors.black87,
-                          fontWeight: FontWeight.w600,
-                          fontSize: 14,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ],
-            ),
-          ),
       ],
     );
   }
@@ -668,6 +604,123 @@ class _HeaderCard extends StatelessWidget {
     } catch (_) {
       return null;
     }
+  }
+}
+
+class _UserProfileCard extends StatelessWidget {
+  final String name;
+  final String imageUrl;
+  final ThemeData theme;
+
+  const _UserProfileCard({
+    required this.name,
+    required this.imageUrl,
+    required this.theme,
+  });
+
+  ImageProvider<Object>? _resolveAvatar(String url) {
+    if (url.isEmpty) return null;
+    try {
+      if (url.startsWith('data:image/')) {
+        final base64Part = url.split(',').last;
+        return MemoryImage(base64Decode(base64Part));
+      }
+      return NetworkImage(url);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isDark = theme.brightness == Brightness.dark;
+    final avatarProvider = _resolveAvatar(imageUrl);
+
+    return Container(
+      margin: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: isDark ? const Color(0xFF1E1E2C) : Colors.white,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(
+          color: isDark ? Colors.white.withOpacity(0.1) : Colors.grey.shade200,
+          width: 1,
+        ),
+        boxShadow: [
+          BoxShadow(
+            color: theme.shadowColor.withOpacity(0.1),
+            blurRadius: 8,
+            offset: const Offset(0, 2),
+          ),
+        ],
+      ),
+      child: Row(
+        children: [
+          Container(
+            width: 56,
+            height: 56,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              border: Border.all(
+                color: isDark ? Colors.deepPurple.shade400 : Colors.deepPurple,
+                width: 2,
+              ),
+            ),
+            child: ClipOval(
+              child: avatarProvider != null
+                  ? Image(
+                      image: avatarProvider,
+                      fit: BoxFit.cover,
+                      errorBuilder: (context, error, stackTrace) {
+                        return Container(
+                          color: isDark ? Colors.grey.shade800 : Colors.grey.shade200,
+                          child: Icon(
+                            Icons.person,
+                            size: 32,
+                            color: isDark ? Colors.white70 : Colors.grey.shade600,
+                          ),
+                        );
+                      },
+                    )
+                  : Container(
+                      color: isDark ? Colors.grey.shade800 : Colors.grey.shade200,
+                      child: Icon(
+                        Icons.person,
+                        size: 32,
+                        color: isDark ? Colors.white70 : Colors.grey.shade600,
+                      ),
+                    ),
+            ),
+          ),
+          const SizedBox(width: 16),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  name.isNotEmpty ? name : 'Utilisateur',
+                  style: GoogleFonts.poppins(
+                    fontSize: 16,
+                    fontWeight: FontWeight.w600,
+                    color: isDark ? Colors.white : Colors.black87,
+                  ),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  'Bienvenue',
+                  style: GoogleFonts.poppins(
+                    fontSize: 12,
+                    color: isDark ? Colors.white70 : Colors.grey.shade600,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
   }
 }
 

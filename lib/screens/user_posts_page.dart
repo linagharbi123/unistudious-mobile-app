@@ -1213,14 +1213,6 @@ class _UserPostsPageState extends State<UserPostsPage> {
           'Failed to ${statusId != null ? 'update' : 'post'} status: ${response.statusCode}, response: $responseBody',
           name: 'UserPostsPage',
         );
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              'Échec de la ${statusId != null ? 'mise à jour' : 'publication'} : ${responseData['message'] ?? 'Erreur inconnue'}',
-              style: Theme.of(context).textTheme.bodyMedium,
-            ),
-          ),
-        );
       }
     } catch (e, stackTrace) {
       developer.log(
@@ -1228,12 +1220,6 @@ class _UserPostsPageState extends State<UserPostsPage> {
         name: 'UserPostsPage',
         error: e,
         stackTrace: stackTrace,
-      );
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Erreur lors de la ${statusId != null ? 'mise à jour' : 'publication'} : $e',
-              style: Theme.of(context).textTheme.bodyMedium),
-        ),
       );
     }
   }

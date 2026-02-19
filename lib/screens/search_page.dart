@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'dart:developer' as developer;
+import '../widgets/notification_icon_button.dart';
 
 class SearchPage extends StatefulWidget {
   final List<Map<String, dynamic>> posts;
@@ -173,6 +174,9 @@ class _SearchPageState extends State<SearchPage> {
             Navigator.pop(context, widget.posts);
           },
         ),
+        actions: [
+          const NotificationIconButton(),
+        ],
       ),
       body: Column(
         children: [

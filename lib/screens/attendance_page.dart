@@ -8,6 +8,7 @@ import 'package:provider/provider.dart';
 import '../providers/auth_provider.dart';
 import '../providers/theme_provider.dart';
 import '../widgets/sidebar.dart';
+import '../widgets/notification_icon_button.dart';
 import 'dart:async';
 
 class AttendancePage extends StatefulWidget {
@@ -358,6 +359,9 @@ class _AttendancePageState extends State<AttendancePage>
             ),
           ),
         ),
+        actions: [
+          const NotificationIconButton(),
+        ],
         bottom: isLoadingSessions || sessions.isEmpty
             ? null
             : TabBar(

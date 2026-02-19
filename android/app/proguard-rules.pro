@@ -9,9 +9,46 @@
 -keep class com.google.android.gms.** { *; }
 -dontwarn com.google.android.gms.**
 
-# Jitsi Meet SDK
+# Jitsi Meet SDK - Règles complètes pour éviter l'obfuscation
 -keep class org.jitsi.** { *; }
+-keep interface org.jitsi.** { *; }
 -dontwarn org.jitsi.**
+
+# WebRTC (utilisé par Jitsi)
+-keep class org.webrtc.** { *; }
+-keep interface org.webrtc.** { *; }
+-dontwarn org.webrtc.**
+
+# Classes natives WebRTC
+-keepclasseswithmembernames class * {
+    native <methods>;
+}
+
+# Réflexion utilisée par Jitsi/WebRTC
+-keepattributes Signature
+-keepattributes Exceptions
+-keepattributes InnerClasses
+-keepattributes EnclosingMethod
+-keepattributes *Annotation*
+
+# Classes utilisées via réflexion
+-keepclassmembers class * {
+    @android.webkit.JavascriptInterface <methods>;
+}
+
+# Gson (si utilisé par Jitsi)
+-keepattributes Signature
+-keepattributes *Annotation*
+-dontwarn sun.misc.**
+-keep class com.google.gson.** { *; }
+-keep class * implements com.google.gson.TypeAdapter
+-keep class * implements com.google.gson.TypeAdapterFactory
+-keep class * implements com.google.gson.JsonSerializer
+-keep class * implements com.google.gson.JsonDeserializer
+
+# React Native (Jitsi utilise React Native)
+-keep class com.facebook.react.** { *; }
+-dontwarn com.facebook.react.**
 
 # WebView
 -keep class com.reactnativecommunity.webview.** { *; }
@@ -45,6 +82,38 @@
 
 # Keep annotations
 -keepattributes *Annotation*
+-keepattributes SourceFile,LineNumberTable
+-keepattributes Exceptions
+
+# Éviter la suppression de classes utilisées via réflexion
+-keepclassmembers class * {
+    @android.webkit.JavascriptInterface <methods>;
+}
+
+# Conserver les classes natives
+-keepclasseswithmembernames,includedescriptorclasses class * {
+    native <methods>;
+}
+
+# Conserver les classes Parcelable
+-keep class * implements android.os.Parcelable {
+    public static final android.os.Parcelable$Creator *;
+}
+
+# Conserver les classes Serializable
+-keepclassmembers class * implements java.io.Serializable {
+    static final long serialVersionUID;
+    private static final java.io.ObjectStreamField[] serialPersistentFields;
+    private void writeObject(java.io.ObjectOutputStream);
+    private void readObject(java.io.ObjectInputStream);
+    java.lang.Object writeReplace();
+    java.lang.Object readResolve();
+}
+
+# Conserver les classes R (ressources)
+-keepclassmembers class **.R$* {
+    public static <fields>;
+}
 
 # Google Play Core (for Flutter deferred components - optional)
 -dontwarn com.google.android.play.core.**

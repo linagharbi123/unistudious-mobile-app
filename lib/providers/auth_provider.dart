@@ -1,8 +1,10 @@
 import 'package:flutter/material.dart';
 import '../services/token_service.dart';
+import '../services/firebase_notification_service.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter/scheduler.dart';
+import 'package:flutter/foundation.dart';
 
 class AuthProvider extends ChangeNotifier {
   final TokenService _tokenService = TokenService();
@@ -30,6 +32,11 @@ class AuthProvider extends ChangeNotifier {
       _error = null;
       // Optionnel : Charger finalUsername depuis une source persistante si nécessaire
       _finalUsername = await _loadFinalUsername();
+      
+      // Sauvegarder automatiquement le token FCM si l'utilisateur est déjà connecté
+      if (_isLoggedIn) {
+        _saveFCMTokenIfAvailable();
+      }
     } catch (e) {
       _error = e.toString();
       _isLoggedIn = false;
@@ -90,6 +97,10 @@ class AuthProvider extends ChangeNotifier {
         // Exemple : _finalUsername = result['finalUsername'];
         // Sinon, il sera défini lors de l'appel à l'API /api/dashboard-social-media
         notifyListeners();
+        
+        // Sauvegarder automatiquement le token FCM après la connexion
+        _saveFCMTokenIfAvailable();
+        
         return true;
       } else {
         _error = result['error'];
@@ -112,6 +123,15 @@ class AuthProvider extends ChangeNotifier {
     notifyListeners();
 
     try {
+      // Supprimer le token FCM du serveur avant la déconnexion
+      final authToken = currentToken;
+      if (authToken != null) {
+        await FirebaseNotificationService.removeTokenFromServer(authToken);
+      }
+      
+      // Supprimer le token FCM localement
+      await FirebaseNotificationService.deleteToken();
+      
       await _tokenService.logout();
       _isLoggedIn = false;
       _error = null;
@@ -158,6 +178,15 @@ class AuthProvider extends ChangeNotifier {
 
   // Effacer le token
   Future<void> clearToken() async {
+    // Supprimer le token FCM du serveur avant la déconnexion
+    final authToken = currentToken;
+    if (authToken != null) {
+      await FirebaseNotificationService.removeTokenFromServer(authToken);
+    }
+    
+    // Supprimer le token FCM localement
+    await FirebaseNotificationService.deleteToken();
+    
     await _tokenService.logout();
     _isLoggedIn = false;
     _error = null;
@@ -191,6 +220,28 @@ class AuthProvider extends ChangeNotifier {
     _isLoggedIn = true;
     _error = null;
     notifyListeners();
+    
+    // Sauvegarder automatiquement le token FCM après la connexion
+    _saveFCMTokenIfAvailable();
+  }
+
+  // Sauvegarder le token FCM si disponible
+  Future<void> _saveFCMTokenIfAvailable() async {
+    try {
+      final fcmToken = await FirebaseNotificationService.getToken();
+      final authToken = currentToken;
+      if (fcmToken != null && authToken != null) {
+        await FirebaseNotificationService.saveTokenToServer(fcmToken, authToken);
+        if (kDebugMode) {
+          print('✅ Token FCM sauvegardé automatiquement après connexion');
+        }
+      }
+    } catch (e) {
+      if (kDebugMode) {
+        print('⚠️ Erreur lors de la sauvegarde automatique du token FCM: $e');
+      }
+      // Ne pas bloquer la connexion en cas d'erreur
+    }
   }
 
   // Méthodes pour gérer les changements de groupe en attente

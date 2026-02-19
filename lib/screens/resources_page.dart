@@ -110,7 +110,29 @@ class _ResourceAudioPlayerScreenState extends State<ResourceAudioPlayerScreen> {
   Future<void> _initializeAudio() async {
     try {
       if (widget.isNetwork) {
-        await _audioPlayer.setSourceUrl(widget.filePath);
+        // Sur iOS, AVPlayer peut avoir des problèmes avec certains formats M4A/MP3 depuis des URLs distantes.
+        // On télécharge toujours le fichier sur iOS avant de le lire pour garantir la compatibilité.
+        if (Platform.isIOS) {
+          final uri = Uri.parse(widget.filePath);
+          final response = await http.get(uri).timeout(const Duration(seconds: 30));
+          if (response.statusCode != 200) {
+            throw Exception('HTTP ${response.statusCode} lors du chargement de l\'audio');
+          }
+
+          final tempDir = await getTemporaryDirectory();
+          final fileNameFromUrl = uri.pathSegments.isNotEmpty
+              ? uri.pathSegments.last
+              : '${DateTime.now().millisecondsSinceEpoch}.m4a';
+          final sanitizedName = fileNameFromUrl.replaceAll('/', '_').replaceAll('\\', '_');
+          final tempFile = File(
+            '${tempDir.path}/resource_audio_${DateTime.now().millisecondsSinceEpoch}_$sanitizedName',
+          );
+          await tempFile.writeAsBytes(response.bodyBytes);
+
+          await _audioPlayer.setSource(DeviceFileSource(tempFile.path));
+        } else {
+          await _audioPlayer.setSourceUrl(widget.filePath);
+        }
       } else {
         await _audioPlayer.setSource(DeviceFileSource(widget.filePath));
       }
@@ -554,9 +576,6 @@ class _ResourcesPageState extends State<ResourcesPage> with SingleTickerProvider
           setState(() {
             isConnectionError = false;
           });
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('Erreur lors de la récupération des ressources : ${foldersResponse.statusCode}')),
-          );
         }
       }
     } catch (e) {
@@ -1607,29 +1626,9 @@ class _FolderDetailsPageState extends State<FolderDetailsPage> {
             ];
           });
         }
-      } else {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('Erreur : ${response.statusCode} - ${response.body}')),
-          );
-        }
       }
     } catch (e) {
-      // Détecter les erreurs de connexion et ne pas afficher de snackbar
-      final isNetworkError = e is SocketException || 
-                             e is TimeoutException ||
-                             e.toString().contains('SocketException') ||
-                             e.toString().contains('Failed host lookup') ||
-                             e.toString().contains('Network is unreachable') ||
-                             e.toString().contains('Connection refused') ||
-                             e.toString().contains('Connection timed out') ||
-                             e.toString().contains('No Internet connection');
-      
-      if (mounted && !isNetworkError) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Erreur réseau : $e')),
-        );
-      }
+      // Erreur silencieuse
     } finally {
       if (mounted) {
         setState(() {
@@ -2074,41 +2073,61 @@ class _FolderDetailsPageState extends State<FolderDetailsPage> {
                                 ),
                               ),
                               const SizedBox(height: 4),
-                              Row(
+                              Wrap(
+                                spacing: 16,
+                                runSpacing: 4,
+                                crossAxisAlignment: WrapCrossAlignment.center,
                                 children: [
-                                  Icon(Icons.storage, size: 14, color: theme.iconTheme.color?.withOpacity(0.5)),
-                                  const SizedBox(width: 4),
-                                  Text(
-                                    widget.folderSize,
-                                    style: TextStyle(
-                                      color: theme.textTheme.bodyMedium?.color ?? Colors.grey[600],
-                                      fontSize: 12,
-                                    ),
+                                  Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Icon(Icons.storage, size: 14, color: theme.iconTheme.color?.withOpacity(0.5)),
+                                      const SizedBox(width: 4),
+                                      Text(
+                                        widget.folderSize,
+                                        style: TextStyle(
+                                          color: theme.textTheme.bodyMedium?.color ?? Colors.grey[600],
+                                          fontSize: 12,
+                                        ),
+                                      ),
+                                    ],
                                   ),
-                                  const SizedBox(width: 16),
-                                  Icon(Icons.access_time, size: 14, color: theme.iconTheme.color?.withOpacity(0.5)),
-                                  const SizedBox(width: 4),
-                                  Text(
-                                    widget.folderTime,
-                                    style: TextStyle(
-                                      color: theme.textTheme.bodyMedium?.color ?? Colors.grey[600],
-                                      fontSize: 12,
-                                    ),
+                                  Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Icon(Icons.access_time, size: 14, color: theme.iconTheme.color?.withOpacity(0.5)),
+                                      const SizedBox(width: 4),
+                                      Text(
+                                        widget.folderTime,
+                                        style: TextStyle(
+                                          color: theme.textTheme.bodyMedium?.color ?? Colors.grey[600],
+                                          fontSize: 12,
+                                        ),
+                                      ),
+                                    ],
                                   ),
                                 ],
                               ),
                               const SizedBox(height: 4),
-                              Row(
+                              Wrap(
+                                spacing: 8,
+                                runSpacing: 4,
+                                crossAxisAlignment: WrapCrossAlignment.center,
                                 children: [
-                                  Icon(Icons.folder_open, size: 14, color: theme.iconTheme.color?.withOpacity(0.5)),
-                                  const SizedBox(width: 4),
-                                  Text(
-                                    '${widget.folderItemsCount} élément${widget.folderItemsCount != '1' ? 's' : ''}',
-                                    style: TextStyle(
-                                      color: theme.textTheme.bodyMedium?.color ?? Colors.grey[600],
-                                      fontSize: 12,
-                                      fontWeight: FontWeight.w500,
-                                    ),
+                                  Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Icon(Icons.folder_open, size: 14, color: theme.iconTheme.color?.withOpacity(0.5)),
+                                      const SizedBox(width: 4),
+                                      Text(
+                                        '${widget.folderItemsCount} élément${widget.folderItemsCount != '1' ? 's' : ''}',
+                                        style: TextStyle(
+                                          color: theme.textTheme.bodyMedium?.color ?? Colors.grey[600],
+                                          fontSize: 12,
+                                          fontWeight: FontWeight.w500,
+                                        ),
+                                      ),
+                                    ],
                                   ),
                                 ],
                               ),

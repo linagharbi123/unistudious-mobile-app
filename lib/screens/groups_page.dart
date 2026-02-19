@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:provider/provider.dart';
 import '../providers/auth_provider.dart';
 import '../providers/loading_provider.dart';
@@ -9,6 +10,10 @@ import 'dart:convert';
 import 'package:intl/intl.dart';
 import 'package:intl/date_symbol_data_local.dart';
 import '../widgets/sidebar.dart';
+import 'package:table_calendar/table_calendar.dart';
+import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
+import 'dart:developer' as developer;
 
 class GroupsPage extends StatefulWidget {
   const GroupsPage({super.key});
@@ -28,6 +33,23 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
   final TextEditingController _reasonController = TextEditingController();
   final Map<int, List<Map<String, dynamic>>> currentGroups = {};
   final String apiBaseUrl = 'https://www.unistudious.com';
+  
+  // Pagination data
+  Map<String, dynamic>? pagination;
+  List<Map<String, dynamic>> uniqueSessionsData = [];
+  
+  // Pagination par session
+  final Map<int, int> _currentPage = {}; // sessionId -> page actuelle
+  final Map<int, bool> _isLoadingMore = {}; // sessionId -> chargement en cours
+  final Map<int, bool> _hasMorePages = {}; // sessionId -> il y a encore des pages
+  final Map<int, ScrollController> _scrollControllers = {}; // sessionId -> ScrollController
+  
+  // Pour les calendriers par session
+  final Map<int, DateTime> _focusedDays = {}; // sessionId -> focusedDay
+  final Map<int, DateTime?> _selectedDays = {}; // sessionId -> selectedDay
+  final Map<int, Map<DateTime, List<Map<String, dynamic>>>> _sessionEvents = {}; // sessionId -> events
+  final Map<int, bool> _isLoadingCalendar = {}; // sessionId -> isLoading
+  final Map<int, Set<String>> _loadedMonths = {}; // sessionId -> loadedMonths
 
   @override
   void initState() {
@@ -43,6 +65,11 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
   void dispose() {
     _tabController?.dispose();
     _reasonController.dispose();
+    // Nettoyer les ScrollControllers
+    for (var controller in _scrollControllers.values) {
+      controller.dispose();
+    }
+    _scrollControllers.clear();
     super.dispose();
   }
 
@@ -59,12 +86,89 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
     }
 
     loadingProvider.showLoading();
-    await Future.delayed(const Duration(milliseconds: 300));
 
     try {
       await fetchSessions();
-      await fetchGroups();
+      
+      // Charger les groupes pour toutes les sessions en parallèle (sans calendriers pour être rapide)
+      if (sessions.isNotEmpty) {
+        final futures = sessions.map((session) async {
+          final sessionId = session['id'];
+          _currentPage[sessionId] = 1;
+          _hasMorePages[sessionId] = true;
+          // Charger les groupes sans calendriers pour être rapide
+          await fetchGroups(sessionId: sessionId, page: 1, perPage: 8, append: false, skipCalendar: true);
+        }).toList();
+        
+        // Attendre que tous les groupes soient chargés en parallèle
+        await Future.wait(futures);
+        
+        // Masquer le loading après que le frame soit rendu pour s'assurer que les groupes sont affichés
+        if (mounted) {
+          SchedulerBinding.instance.addPostFrameCallback((_) {
+            if (mounted) {
+              loadingProvider.hideLoading();
+            }
+          });
+        }
+        
+        // Charger les calendriers en arrière-plan après l'affichage
+        Future.microtask(() async {
+          for (var session in sessions) {
+            final sessionId = session['id'];
+            await _loadCalendarForGroups(sessionId);
+          }
+        });
+      }
+      
       await fetchCurrentGroupForSessions();
+      
+      // Charger immédiatement le calendrier de la première session avec startDate et endDate
+      if (sessions.isNotEmpty) {
+        final firstSessionId = sessions.first['id'];
+        // Initialiser les structures pour la première session
+        if (!_focusedDays.containsKey(firstSessionId)) {
+          _focusedDays[firstSessionId] = DateTime.now();
+          _selectedDays[firstSessionId] = null;
+          _sessionEvents[firstSessionId] = {};
+          _isLoadingCalendar[firstSessionId] = false;
+          _loadedMonths[firstSessionId] = {};
+        }
+        // Charger le mois actuel immédiatement
+        _fetchSessionCalendarEvents(firstSessionId, isPriority: true);
+        // Charger les autres mois en arrière-plan
+        Future.delayed(const Duration(milliseconds: 500), () {
+          if (mounted) {
+            _loadOtherMonthsInBackground(firstSessionId);
+          }
+        });
+        // Charger les autres sessions en arrière-plan
+        Future.delayed(const Duration(milliseconds: 800), () {
+          if (mounted && sessions.length > 1) {
+            for (int i = 1; i < sessions.length; i++) {
+              final sessionId = sessions[i]['id'];
+              if (!_focusedDays.containsKey(sessionId)) {
+                _focusedDays[sessionId] = DateTime.now();
+                _selectedDays[sessionId] = null;
+                _sessionEvents[sessionId] = {};
+                _isLoadingCalendar[sessionId] = false;
+                _loadedMonths[sessionId] = {};
+              }
+              _fetchSessionCalendarEvents(sessionId, isPriority: false);
+              Future.delayed(Duration(milliseconds: 200 * i), () {
+                if (mounted) {
+                  _loadOtherMonthsInBackground(sessionId);
+                }
+              });
+            }
+          }
+        });
+      }
+    } catch (e) {
+      developer.log('🔴 Erreur dans _checkAuthAndFetchData: $e', name: 'GroupsPage', error: e);
+      setState(() {
+        errorMessage = 'Erreur lors du chargement: $e';
+      });
     } finally {
       loadingProvider.hideLoading();
       setState(() {
@@ -76,12 +180,48 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
   Future<void> refreshData() async {
     final loadingProvider = Provider.of<LoadingProvider>(context, listen: false);
     loadingProvider.showLoading();
+    
     try {
       await fetchSessions();
-      await fetchGroups();
+      // Réinitialiser la pagination pour toutes les sessions et charger en parallèle
+      if (sessions.isNotEmpty) {
+        final futures = sessions.map((session) async {
+          final sessionId = session['id'];
+          _currentPage[sessionId] = 1;
+          _hasMorePages[sessionId] = true;
+          await fetchGroups(sessionId: sessionId, page: 1, perPage: 8, append: false, skipCalendar: true);
+        }).toList();
+        
+        await Future.wait(futures);
+        
+        // Masquer le loading après que le frame soit rendu pour s'assurer que les groupes sont affichés
+        if (mounted) {
+          SchedulerBinding.instance.addPostFrameCallback((_) {
+            if (mounted) {
+              loadingProvider.hideLoading();
+            }
+          });
+        }
+        
+        // Charger les calendriers en arrière-plan
+        Future.microtask(() async {
+          for (var session in sessions) {
+            final sessionId = session['id'];
+            await _loadCalendarForGroups(sessionId);
+          }
+        });
+      }
+      
       await fetchCurrentGroupForSessions();
+    } catch (e) {
+      setState(() {
+        errorMessage = 'Erreur lors du rafraîchissement: $e';
+      });
     } finally {
       loadingProvider.hideLoading();
+      setState(() {
+        isLoading = false;
+      });
     }
   }
 
@@ -131,18 +271,108 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
     }
   }
 
-  Future<void> fetchGroups() async {
+  // Fonction pour charger les calendriers pour les groupes d'une session
+  Future<void> _loadCalendarForGroups(int sessionId) async {
+    if (!mounted) return;
+    
+    try {
+      final authProvider = Provider.of<AuthProvider>(context, listen: false);
+      
+      // Vérifier qu'il y a des groupes pour cette session
+      final sessionGroups = groups.where((g) => g['sessionId'] == sessionId).toList();
+      if (sessionGroups.isEmpty) return;
+      
+      developer.log('📅 Chargement du calendrier pour sessionId: $sessionId', name: 'GroupsPage');
+      
+      final calendarEndpoint = '/api/get-calander-group-management/$sessionId';
+      final calendarResponse = await authProvider
+          .authenticatedRequest('GET', calendarEndpoint);
+
+      if (calendarResponse.statusCode == 200 && mounted) {
+        final Map<String, dynamic> calendarData = jsonDecode(calendarResponse.body);
+        final List<dynamic> calendarEvents = calendarData['calendarEvents'] ?? [];
+
+        setState(() {
+          for (var group in groups) {
+            if (group['sessionId'] == sessionId) {
+              final event = calendarEvents.firstWhere(
+                    (event) => event['groupId'] == group['groupId'],
+                orElse: () => {},
+              );
+              if (event.isNotEmpty) {
+                group['teacher'] = event['teacherName'] ?? 'Unknown';
+                group['subject'] = event['subjectName'] ?? 'Unknown';
+              }
+            }
+          }
+        });
+        
+        developer.log('📅 ✅ Calendrier chargé pour sessionId: $sessionId', name: 'GroupsPage');
+      }
+    } catch (e) {
+      developer.log('🔴 Erreur lors du chargement du calendrier pour sessionId $sessionId: $e', name: 'GroupsPage');
+    }
+  }
+
+  Future<void> fetchGroups({int? sessionId, int page = 1, int perPage = 8, bool append = false, bool skipCalendar = false}) async {
+    developer.log('🔵 fetchGroups appelé - sessionId: $sessionId, page: $page, perPage: $perPage, append: $append', name: 'GroupsPage');
     final authProvider = Provider.of<AuthProvider>(context, listen: false);
     const String groupsEndpoint = '/api/get-group-management';
 
     try {
+      // Construire l'URI avec les paramètres de requête
+      final uri = Uri.parse('$apiBaseUrl$groupsEndpoint').replace(
+        queryParameters: {
+          if (sessionId != null) 'sessionId': sessionId.toString(),
+          'page': page.toString(),
+          'perPage': perPage.toString(),
+        },
+      );
+
+      developer.log('🔵 URI construite: ${uri.toString()}', name: 'GroupsPage');
+      developer.log('🔵 Envoi de la requête API...', name: 'GroupsPage');
+
       final groupsResponse = await authProvider
-          .authenticatedRequest('GET', groupsEndpoint)
-          .timeout(const Duration(seconds: 30));
+          .authenticatedRequest('GET', uri.toString());
+
+      developer.log('🔵 Réponse reçue - Status: ${groupsResponse.statusCode}', name: 'GroupsPage');
 
       if (groupsResponse.statusCode == 200) {
         final Map<String, dynamic> groupsData = jsonDecode(groupsResponse.body);
         final List<dynamic> rawGroups = groupsData['groups'] ?? [];
+        
+        developer.log('🔵 Nombre de groupes reçus: ${rawGroups.length}', name: 'GroupsPage');
+        
+        // Gérer la pagination
+        if (groupsData['pagination'] != null) {
+          final paginationData = Map<String, dynamic>.from(groupsData['pagination']);
+          final currentPageNum = paginationData['currentPage'] as int? ?? page;
+          final totalPages = paginationData['totalPages'] as int? ?? 1;
+          
+          developer.log('🔵 Pagination - currentPage: $currentPageNum, totalPages: $totalPages', name: 'GroupsPage');
+          
+          if (sessionId != null) {
+            setState(() {
+              _currentPage[sessionId] = currentPageNum;
+              _hasMorePages[sessionId] = currentPageNum < totalPages;
+            });
+            developer.log('🔵 État pagination mis à jour pour sessionId $sessionId - hasMorePages: ${_hasMorePages[sessionId]}', name: 'GroupsPage');
+          }
+          
+          setState(() {
+            pagination = paginationData;
+          });
+        }
+        
+        // Gérer uniqueSessionsData
+        if (groupsData['uniqueSessionsData'] != null) {
+          setState(() {
+            uniqueSessionsData = List<Map<String, dynamic>>.from(
+              groupsData['uniqueSessionsData'].map((session) => Map<String, dynamic>.from(session))
+            );
+          });
+        }
+        
         List<Map<String, dynamic>> tempGroups = rawGroups.map((group) {
           final capacityStr = group['capacity']?.toString() ?? '0';
           int capacity;
@@ -168,55 +398,141 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
           };
         }).toList();
 
-        for (var session in sessions) {
-          final sessionId = session['id'];
-          final calendarEndpoint = '/api/get-calander-group-management/$sessionId';
-          final calendarResponse = await authProvider
-              .authenticatedRequest('GET', calendarEndpoint)
-              .timeout(const Duration(seconds: 30));
+        developer.log('🔵 Groupes transformés: ${tempGroups.length} groupes', name: 'GroupsPage');
+        developer.log('🔵 Groupes pour sessionId $sessionId: ${tempGroups.where((g) => g['sessionId'] == sessionId).length}', name: 'GroupsPage');
 
-          if (calendarResponse.statusCode == 200) {
-            final Map<String, dynamic> calendarData = jsonDecode(calendarResponse.body);
-            final List<dynamic> calendarEvents = calendarData['calendarEvents'] ?? [];
+        // Charger les calendriers seulement si skipCalendar est false
+        if (!skipCalendar) {
+          // Charger les calendriers seulement pour la session concernée ou pour toutes les sessions si sessionId est null
+          final sessionsToProcess = sessionId != null 
+              ? sessions.where((s) => s['id'] == sessionId).toList()
+              : sessions;
 
-            for (var group in tempGroups) {
-              if (group['sessionId'] == sessionId) {
-                final event = calendarEvents.firstWhere(
-                      (event) => event['groupId'] == group['groupId'],
-                  orElse: () => {},
-                );
-                if (event.isNotEmpty) {
-                  group['teacher'] = event['teacherName'] ?? 'Unknown';
-                  group['subject'] = event['subjectName'] ?? 'Unknown';
+          for (var session in sessionsToProcess) {
+            final currentSessionId = session['id'];
+            // Ne charger le calendrier que pour les groupes de cette session
+            final groupsForThisSession = tempGroups.where((g) => g['sessionId'] == currentSessionId).toList();
+            
+            if (groupsForThisSession.isNotEmpty) {
+              try {
+                final calendarEndpoint = '/api/get-calander-group-management/$currentSessionId';
+                final calendarResponse = await authProvider
+                    .authenticatedRequest('GET', calendarEndpoint);
+
+                if (calendarResponse.statusCode == 200) {
+                  final Map<String, dynamic> calendarData = jsonDecode(calendarResponse.body);
+                  final List<dynamic> calendarEvents = calendarData['calendarEvents'] ?? [];
+
+                  for (var group in groupsForThisSession) {
+                    final event = calendarEvents.firstWhere(
+                          (event) => event['groupId'] == group['groupId'],
+                      orElse: () => {},
+                    );
+                    if (event.isNotEmpty) {
+                      group['teacher'] = event['teacherName'] ?? 'Unknown';
+                      group['subject'] = event['subjectName'] ?? 'Unknown';
+                    }
+
+                    if (group['joined'] || !group['pendingJoin']) {
+                      await authProvider.removePendingChange(currentSessionId, group['groupId']);
+                      await authProvider.removePendingJoin(currentSessionId, group['groupId']);
+                    }
+                  }
                 }
-
-                if (group['joined'] || !group['pendingJoin']) {
-                  await authProvider.removePendingChange(sessionId, group['groupId']);
-                  await authProvider.removePendingJoin(sessionId, group['groupId']);
-                }
+              } catch (e) {
+                // En cas d'erreur sur le calendrier, continuer avec les groupes sans les infos de calendrier
+                // Les groupes seront quand même ajoutés avec 'Unknown' pour teacher et subject
               }
             }
           }
         }
 
+        developer.log('🔵 Avant setState - Nombre total de groupes actuels: ${groups.length}', name: 'GroupsPage');
+        developer.log('🔵 append: $append, sessionId: $sessionId', name: 'GroupsPage');
+        
         setState(() {
-          groups = tempGroups;
+          if (append && sessionId != null) {
+            // Ajouter les nouveaux groupes à la liste existante pour cette session
+            // Garder les groupes des autres sessions
+            final otherSessionsGroups = groups.where((g) => g['sessionId'] != sessionId).toList();
+            // Garder les groupes existants de cette session
+            final existingSessionGroups = groups.where((g) => g['sessionId'] == sessionId).toList();
+            // Ajouter les nouveaux groupes de cette session
+            final newGroupsForSession = tempGroups.where((g) => g['sessionId'] == sessionId).toList();
+            developer.log('🔵 Mode APPEND - otherSessionsGroups: ${otherSessionsGroups.length}, existingSessionGroups: ${existingSessionGroups.length}, newGroupsForSession: ${newGroupsForSession.length}', name: 'GroupsPage');
+            // Combiner : autres sessions + groupes existants de cette session + nouveaux groupes de cette session
+            groups = [...otherSessionsGroups, ...existingSessionGroups, ...newGroupsForSession];
+            developer.log('🔵 Après APPEND - Nombre total de groupes: ${groups.length}', name: 'GroupsPage');
+            developer.log('🔵 Groupes pour sessionId $sessionId: ${groups.where((g) => g['sessionId'] == sessionId).length}', name: 'GroupsPage');
+          } else {
+            // Remplacer tous les groupes ou seulement ceux de la session spécifiée
+            if (sessionId != null) {
+              final otherSessionsGroups = groups.where((g) => g['sessionId'] != sessionId).toList();
+              final thisSessionGroups = tempGroups.where((g) => g['sessionId'] == sessionId).toList();
+              developer.log('🔵 Mode REPLACE pour sessionId $sessionId - otherSessionsGroups: ${otherSessionsGroups.length}, thisSessionGroups: ${thisSessionGroups.length}', name: 'GroupsPage');
+              groups = [...otherSessionsGroups, ...thisSessionGroups];
+            } else {
+              developer.log('🔵 Mode REPLACE tous les groupes - tempGroups: ${tempGroups.length}', name: 'GroupsPage');
+              groups = tempGroups;
+            }
+            developer.log('🔵 Après REPLACE - Nombre total de groupes: ${groups.length}', name: 'GroupsPage');
+          }
         });
+        
+        developer.log('🔵 ✅ setState terminé - Nombre final de groupes: ${groups.length}', name: 'GroupsPage');
       } else if (groupsResponse.statusCode == 401 || groupsResponse.statusCode == 403) {
+        developer.log('🔴 Erreur d\'authentification: ${groupsResponse.statusCode}', name: 'GroupsPage');
         if (mounted) {
           SnackBarHelper.showError(context, 'Session expirée. Veuillez vous reconnecter.');
           Navigator.pushReplacementNamed(context, '/login');
         }
         await authProvider.logout();
       } else {
+        developer.log('🔴 Erreur HTTP: ${groupsResponse.statusCode}', name: 'GroupsPage');
+        developer.log('🔴 Body de la réponse: ${groupsResponse.body}', name: 'GroupsPage');
         setState(() {
           errorMessage = 'Échec du chargement des groupes : ${groupsResponse.statusCode}';
         });
       }
-    } catch (e) {
+    } catch (e, stackTrace) {
+      developer.log('🔴 Exception dans fetchGroups: $e', name: 'GroupsPage', error: e, stackTrace: stackTrace);
       setState(() {
         errorMessage = 'Erreur lors de la récupération des groupes : $e';
       });
+    }
+  }
+
+  Future<void> loadMoreGroups(int sessionId, {int perPage = 8}) async {
+    developer.log('🟢 loadMoreGroups appelé pour sessionId: $sessionId', name: 'GroupsPage');
+    developer.log('🟢 _isLoadingMore[$sessionId]: ${_isLoadingMore[sessionId]}', name: 'GroupsPage');
+    developer.log('🟢 _hasMorePages[$sessionId]: ${_hasMorePages[sessionId]}', name: 'GroupsPage');
+    
+    if (_isLoadingMore[sessionId] == true || _hasMorePages[sessionId] == false) {
+      developer.log('🟡 loadMoreGroups annulé - isLoadingMore: ${_isLoadingMore[sessionId]}, hasMorePages: ${_hasMorePages[sessionId]}', name: 'GroupsPage');
+      return;
+    }
+
+    developer.log('🟢 Démarrage du chargement de plus de groupes...', name: 'GroupsPage');
+    setState(() {
+      _isLoadingMore[sessionId] = true;
+    });
+
+    final currentPage = _currentPage[sessionId] ?? 1;
+    final nextPage = currentPage + 1;
+    developer.log('🟢 Page actuelle: $currentPage, Page suivante: $nextPage', name: 'GroupsPage');
+    
+    try {
+      await fetchGroups(sessionId: sessionId, page: nextPage, perPage: perPage, append: true);
+      developer.log('🟢 fetchGroups terminé avec succès', name: 'GroupsPage');
+    } catch (e) {
+      developer.log('🔴 Erreur dans loadMoreGroups: $e', name: 'GroupsPage', error: e);
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isLoadingMore[sessionId] = false;
+        });
+        developer.log('🟢 _isLoadingMore[$sessionId] mis à false', name: 'GroupsPage');
+      }
     }
   }
 
@@ -340,6 +656,586 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
       });
       return [];
     }
+  }
+
+  String _getMonthKey(DateTime date) {
+    return '${date.year}-${date.month}';
+  }
+
+  Future<void> _fetchSessionCalendarEvents(int sessionId, {DateTime? monthDate, bool isPriority = false}) async {
+    // Initialiser les structures pour cette session si nécessaire
+    if (!_focusedDays.containsKey(sessionId)) {
+      _focusedDays[sessionId] = DateTime.now();
+      _selectedDays[sessionId] = null;
+      _sessionEvents[sessionId] = {};
+      _isLoadingCalendar[sessionId] = false;
+      _loadedMonths[sessionId] = {};
+    }
+    
+    final targetMonth = monthDate ?? _focusedDays[sessionId]!;
+    final monthKey = _getMonthKey(targetMonth);
+    
+    if (_loadedMonths[sessionId]!.contains(monthKey) && !isPriority) {
+      return;
+    }
+
+    // Calculer startDate et endDate pour le mois ciblé
+    final firstDayOfMonth = DateTime(targetMonth.year, targetMonth.month, 1);
+    final lastDayOfMonth = DateTime(targetMonth.year, targetMonth.month + 1, 0);
+    
+    // Formater les dates au format ISO 8601
+    final startDate = firstDayOfMonth.toUtc().toIso8601String();
+    final endDate = lastDayOfMonth.toUtc().toIso8601String();
+
+    // Ne jamais afficher le loader dans le calendrier
+    // Le chargement se fait en arrière-plan
+
+    try {
+      final authProvider = Provider.of<AuthProvider>(context, listen: false);
+      Map<DateTime, List<Map<String, dynamic>>> newEvents = {};
+
+      // Construire l'URL
+      final uri = Uri.parse('$apiBaseUrl/api/get-calander-group-management/$sessionId');
+
+      // Récupérer le token d'authentification
+      final prefs = await SharedPreferences.getInstance();
+      final token = prefs.getString('auth_token') ?? '';
+      
+      if (token.isEmpty) {
+        throw Exception('Aucun token d\'authentification trouvé.');
+      }
+
+      // Créer une requête MultipartRequest pour GET avec form-data (comme dans calendar_page.dart)
+      final request = http.MultipartRequest('GET', uri)
+        ..headers['Authorization'] = 'Bearer $token'
+        ..fields['startDate'] = startDate
+        ..fields['endDate'] = endDate
+        ..fields['sessionId'] = sessionId.toString();
+
+      // Envoyer la requête avec un timeout plus court pour le mois actuel
+      final timeoutDuration = isPriority ? const Duration(seconds: 15) : const Duration(seconds: 30);
+      final streamedResponse = await request.send().timeout(timeoutDuration);
+      final response = await http.Response.fromStream(streamedResponse);
+
+      if (response.statusCode == 200) {
+        final Map<String, dynamic> data = jsonDecode(response.body);
+        final List<dynamic> rawEvents = data['calendarEvents'] ?? [];
+
+        // Créer un cache temporaire des noms de groupes pour éviter les recherches répétées
+        final groupNameCache = <int, String>{};
+        
+        for (var event in rawEvents) {
+          if (event['start'] != null && event['end'] != null) {
+            DateTime? start, end;
+            try {
+              start = DateTime.parse(event['start']).toLocal();
+              end = DateTime.parse(event['end']).toLocal();
+            } catch (e) {
+              continue;
+            }
+
+            // Utiliser la date de début (start) pour déterminer le jour d'affichage
+            final normalizedDate = DateTime(start.year, start.month, start.day);
+            
+            // Utiliser le cache pour le nom du groupe
+            final groupId = event['groupId'] as int;
+            String groupName = groupNameCache[groupId] ?? '';
+            if (groupName.isEmpty) {
+              final group = groups.firstWhere(
+                (g) => g['groupId'] == groupId && g['sessionId'] == sessionId,
+                orElse: () => {'name': 'Groupe inconnu'},
+              );
+              groupName = group['name'] ?? 'Groupe inconnu';
+              groupNameCache[groupId] = groupName;
+            }
+            
+            final eventData = {
+              'id': event['id'],
+              'ref': event['ref'],
+              'title': event['title'] ?? 'Sans titre',
+              'start': start,
+              'end': end,
+              'backgroundColor': event['backgroundColor'],
+              'description': event['description'] ?? '',
+              'date': start, // Utiliser start comme date d'affichage
+              'sessionId': event['sessionId'],
+              'groupId': groupId,
+              'groupName': groupName,
+              'teacherName': event['teacherName'] ?? 'Unknown',
+              'subjectName': event['subjectName'] ?? 'Unknown',
+            };
+
+            newEvents.putIfAbsent(normalizedDate, () => []);
+            newEvents[normalizedDate]!.add(eventData);
+          }
+        }
+      }
+
+      _loadedMonths[sessionId]!.add(monthKey);
+
+      if (mounted) {
+        setState(() {
+          _sessionEvents[sessionId] = {..._sessionEvents[sessionId]!, ...newEvents};
+          // Désactiver le loader immédiatement après avoir reçu les données
+          _isLoadingCalendar[sessionId] = false;
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _isLoadingCalendar[sessionId] = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _loadOtherMonthsInBackground(int sessionId) async {
+    // Charger les mois précédents et suivants en arrière-plan sans loader
+    final currentMonth = _focusedDays[sessionId] ?? DateTime.now();
+    
+    // Charger 2 mois précédents et 2 mois suivants
+    for (int i = -2; i <= 2; i++) {
+      if (i == 0) continue; // Le mois actuel est déjà chargé
+      
+      final monthToLoad = DateTime(currentMonth.year, currentMonth.month + i, 1);
+      final monthKey = _getMonthKey(monthToLoad);
+      
+      if (!(_loadedMonths[sessionId]?.contains(monthKey) ?? false)) {
+        _fetchSessionCalendarEvents(sessionId, monthDate: monthToLoad, isPriority: false);
+      }
+    }
+  }
+
+  List<Map<String, dynamic>> _getEventsForDay(int sessionId, DateTime day) {
+    final normalizedDay = DateTime(day.year, day.month, day.day);
+    return _sessionEvents[sessionId]?[normalizedDay] ?? [];
+  }
+
+  void _onDaySelected(int sessionId, DateTime selectedDay, DateTime focusedDay) {
+    setState(() {
+      _selectedDays[sessionId] = selectedDay;
+      _focusedDays[sessionId] = focusedDay;
+    });
+    _showDayEventsDialog(sessionId, selectedDay);
+  }
+
+  void _showDayEventsDialog(int sessionId, DateTime day) {
+    final events = _getEventsForDay(sessionId, day);
+    final theme = Theme.of(context);
+    final isDark = theme.brightness == Brightness.dark;
+    final dateFormat = DateFormat('EEEE d MMMM yyyy', 'fr_FR');
+
+    showDialog(
+      context: context,
+      builder: (context) => Dialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        backgroundColor: theme.dialogBackgroundColor,
+        child: Container(
+          constraints: BoxConstraints(maxHeight: MediaQuery.of(context).size.height * 0.7),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    colors: isDark
+                        ? const [Color(0xFF1A003D), Color(0xFF3C0D73)]
+                        : const [Color(0xFF8E2DE2), Color(0xFF4A00E0)],
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                  ),
+                  borderRadius: const BorderRadius.only(
+                    topLeft: Radius.circular(20),
+                    topRight: Radius.circular(20),
+                  ),
+                ),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Expanded(
+                      child: Text(
+                        dateFormat.format(day),
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 18,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.close, color: Colors.white),
+                      onPressed: () => Navigator.pop(context),
+                    ),
+                  ],
+                ),
+              ),
+              Flexible(
+                child: events.isEmpty
+                    ? Padding(
+                        padding: const EdgeInsets.all(32),
+                        child: Text(
+                          'Aucune séance prévue ce jour',
+                          style: TextStyle(
+                            color: isDark ? Colors.grey[400] : Colors.grey[600],
+                            fontSize: 16,
+                          ),
+                          textAlign: TextAlign.center,
+                        ),
+                      )
+                    : ListView.builder(
+                        shrinkWrap: true,
+                        padding: const EdgeInsets.all(16),
+                        itemCount: events.length,
+                        itemBuilder: (context, index) {
+                          final event = events[index];
+                          final startTime = DateFormat('HH:mm').format(event['start'] as DateTime);
+                          final endTime = DateFormat('HH:mm').format(event['end'] as DateTime);
+                          final groupName = event['groupName'] ?? 'Groupe inconnu';
+                          final teacherName = event['teacherName'] ?? 'Enseignant non spécifié';
+                          final subjectName = event['subjectName'] ?? 'Matière non spécifiée';
+                          final description = event['description']?.toString().trim() ?? '';
+
+                          return Card(
+                            margin: const EdgeInsets.only(bottom: 16),
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(16),
+                            ),
+                            elevation: 3,
+                            color: theme.cardColor,
+                            child: Padding(
+                              padding: const EdgeInsets.all(16),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  // Barre verticale et nom du groupe
+                                  Row(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    children: [
+                                      Container(
+                                        width: 4,
+                                        height: 60,
+                                        decoration: BoxDecoration(
+                                          color: theme.primaryColor,
+                                          borderRadius: BorderRadius.circular(2),
+                                        ),
+                                      ),
+                                      const SizedBox(width: 16),
+                                      Expanded(
+                                        child: Column(
+                                          crossAxisAlignment: CrossAxisAlignment.start,
+                                          children: [
+                                            // Nom du groupe en grand
+                                            Text(
+                                              groupName,
+                                              style: theme.textTheme.titleLarge?.copyWith(
+                                                fontWeight: FontWeight.bold,
+                                                fontSize: 20,
+                                              ) ?? const TextStyle(
+                                                fontWeight: FontWeight.bold,
+                                                fontSize: 20,
+                                              ),
+                                            ),
+                                            const SizedBox(height: 4),
+                                            // Titre de la séance
+                                            if (event['title'] != null && event['title'].toString().isNotEmpty)
+                                              Text(
+                                                event['title'],
+                                                style: theme.textTheme.bodyMedium?.copyWith(
+                                                  color: isDark ? Colors.grey[300] : Colors.grey[700],
+                                                  fontSize: 14,
+                                                ) ?? TextStyle(
+                                                  color: isDark ? Colors.grey[300] : Colors.grey[700],
+                                                  fontSize: 14,
+                                                ),
+                                              ),
+                                          ],
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                  const SizedBox(height: 16),
+                                  // Heure avec icône
+                                  Row(
+                                    children: [
+                                      Icon(
+                                        Icons.access_time,
+                                        size: 18,
+                                        color: theme.primaryColor,
+                                      ),
+                                      const SizedBox(width: 8),
+                                      Text(
+                                        '$startTime - $endTime',
+                                        style: theme.textTheme.bodyLarge?.copyWith(
+                                          color: theme.primaryColor,
+                                          fontWeight: FontWeight.w600,
+                                          fontSize: 16,
+                                        ) ?? TextStyle(
+                                          color: theme.primaryColor,
+                                          fontWeight: FontWeight.w600,
+                                          fontSize: 16,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                  const SizedBox(height: 12),
+                                  // Enseignant
+                                  Row(
+                                    children: [
+                                      Icon(
+                                        Icons.person,
+                                        size: 18,
+                                        color: isDark ? Colors.grey[400] : Colors.grey[600],
+                                      ),
+                                      const SizedBox(width: 8),
+                                      Expanded(
+                                        child: Text(
+                                          'Enseignant : $teacherName',
+                                          style: theme.textTheme.bodyMedium?.copyWith(
+                                            color: isDark ? Colors.grey[300] : Colors.grey[700],
+                                          ) ?? TextStyle(
+                                            color: isDark ? Colors.grey[300] : Colors.grey[700],
+                                          ),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                  const SizedBox(height: 8),
+                                  // Matière
+                                  Row(
+                                    children: [
+                                      Icon(
+                                        Icons.book,
+                                        size: 18,
+                                        color: isDark ? Colors.grey[400] : Colors.grey[600],
+                                      ),
+                                      const SizedBox(width: 8),
+                                      Expanded(
+                                        child: Text(
+                                          'Matière : $subjectName',
+                                          style: theme.textTheme.bodyMedium?.copyWith(
+                                            color: isDark ? Colors.grey[300] : Colors.grey[700],
+                                          ) ?? TextStyle(
+                                            color: isDark ? Colors.grey[300] : Colors.grey[700],
+                                          ),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                  // Description si elle existe et n'est pas technique
+                                  if (description.isNotEmpty && 
+                                      !description.toLowerCase().contains('group') &&
+                                      !description.toLowerCase().contains('has learning') &&
+                                      !description.toLowerCase().contains('with teacher') &&
+                                      !description.toLowerCase().contains('on subject')) ...[
+                                    const SizedBox(height: 12),
+                                    const Divider(height: 1),
+                                    const SizedBox(height: 12),
+                                    Text(
+                                      'Description',
+                                      style: theme.textTheme.titleSmall?.copyWith(
+                                        fontWeight: FontWeight.bold,
+                                        color: isDark ? Colors.grey[300] : Colors.grey[700],
+                                      ) ?? TextStyle(
+                                        fontWeight: FontWeight.bold,
+                                        color: isDark ? Colors.grey[300] : Colors.grey[700],
+                                      ),
+                                    ),
+                                    const SizedBox(height: 4),
+                                    Text(
+                                      description,
+                                      style: theme.textTheme.bodyMedium?.copyWith(
+                                        color: isDark ? Colors.grey[400] : Colors.grey[600],
+                                        height: 1.4,
+                                      ) ?? TextStyle(
+                                        color: isDark ? Colors.grey[400] : Colors.grey[600],
+                                        height: 1.4,
+                                      ),
+                                    ),
+                                  ],
+                                ],
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSessionCalendar(int sessionId) {
+    final theme = Theme.of(context);
+    final isDark = theme.brightness == Brightness.dark;
+    // Palette de couleurs pour le calendrier (assortie au violet de l'app)
+    final Color todayColor = isDark
+        ? const Color(0xFF2962FF) // bleu un peu plus vif en mode sombre
+        : const Color(0xFF1E88E5); // bleu moyen en mode clair
+    final Color selectedDayColor = theme.primaryColor; // violet principal
+    final Color markerColor = isDark
+        ? const Color(0xFFB388FF) // violet clair en mode sombre
+        : const Color(0xFFD1C4E9); // violet très clair en mode clair
+    // Couleur pour le titre \"Calendrier - session\" (pas en violet)
+    final Color calendarTitleColor = isDark
+        ? const Color(0xFFBBDEFB) // bleu très clair en mode sombre
+        : const Color(0xFF1976D2); // bleu soutenu en mode clair
+    // Couleur pour le mois et les chevrons de navigation (en violet)
+    final Color headerAccentColor = theme.primaryColor;
+    
+    // Initialiser si nécessaire
+    if (!_focusedDays.containsKey(sessionId)) {
+      _focusedDays[sessionId] = DateTime.now();
+      _selectedDays[sessionId] = null;
+      _sessionEvents[sessionId] = {};
+      _isLoadingCalendar[sessionId] = false;
+      _loadedMonths[sessionId] = {};
+    }
+
+    final focusedDay = _focusedDays[sessionId]!;
+    final selectedDay = _selectedDays[sessionId];
+    final sessionName = sessions.firstWhere(
+      (s) => s['id'] == sessionId,
+      orElse: () => {'name': 'Session'},
+    )['name'];
+
+    return Card(
+      elevation: 4,
+      margin: const EdgeInsets.only(bottom: 16),
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(20),
+      ),
+      color: theme.cardColor,
+      child: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(
+                  Icons.calendar_today,
+                  color: headerAccentColor,
+                  size: 24,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    'Calendrier - $sessionName',
+                    style: theme.textTheme.titleLarge?.copyWith(
+                      fontWeight: FontWeight.bold,
+                      color: calendarTitleColor,
+                    ) ?? TextStyle(
+                      fontSize: 20,
+                      fontWeight: FontWeight.bold,
+                      color: calendarTitleColor,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Text(
+              'Toutes les séances de tous les groupes de cette session',
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: isDark ? Colors.grey[400] : Colors.grey[600],
+              ) ?? TextStyle(
+                color: isDark ? Colors.grey[400] : Colors.grey[600],
+              ),
+            ),
+            const SizedBox(height: 16),
+            TableCalendar(
+              locale: 'fr_FR',
+              firstDay: DateTime.utc(2020, 1, 1),
+              lastDay: DateTime.utc(2100, 12, 31),
+              focusedDay: focusedDay,
+              calendarFormat: CalendarFormat.month,
+              selectedDayPredicate: (day) =>
+                  selectedDay != null && isSameDay(selectedDay, day),
+              onDaySelected: (selected, focused) =>
+                  _onDaySelected(sessionId, selected, focused),
+              onPageChanged: (focused) {
+                setState(() {
+                  _focusedDays[sessionId] = focused;
+                });
+                final monthKey = _getMonthKey(focused);
+                if (!(_loadedMonths[sessionId]?.contains(monthKey) ?? false)) {
+                  _fetchSessionCalendarEvents(
+                    sessionId,
+                    monthDate: focused,
+                    isPriority: true,
+                  );
+                }
+              },
+              eventLoader: (day) {
+                final events = _getEventsForDay(sessionId, day);
+                return events.map((e) => e['title'] as String).toList();
+              },
+              calendarStyle: CalendarStyle(
+                todayDecoration: BoxDecoration(
+                  color: todayColor,
+                  shape: BoxShape.circle,
+                ),
+                selectedDecoration: BoxDecoration(
+                  color: selectedDayColor,
+                  shape: BoxShape.circle,
+                ),
+                todayTextStyle: const TextStyle(
+                  color: Colors.white,
+                  fontWeight: FontWeight.bold,
+                ),
+                selectedTextStyle: const TextStyle(
+                  color: Colors.white,
+                  fontWeight: FontWeight.bold,
+                ),
+                defaultTextStyle: TextStyle(
+                  color: isDark ? Colors.white70 : Colors.black87,
+                ),
+                weekendTextStyle: TextStyle(
+                  color: isDark ? Colors.red[300] : Colors.red[600],
+                ),
+                outsideTextStyle: TextStyle(
+                  color: isDark ? Colors.grey[600] : Colors.grey[400],
+                ),
+                markerDecoration: BoxDecoration(
+                  color: markerColor,
+                  shape: BoxShape.circle,
+                ),
+                markersMaxCount: 3,
+                markersAlignment: Alignment.bottomCenter,
+              ),
+              headerStyle: HeaderStyle(
+                formatButtonVisible: false,
+                titleCentered: true,
+                titleTextStyle: TextStyle(
+                  color: headerAccentColor,
+                  fontSize: 18,
+                  fontWeight: FontWeight.bold,
+                ),
+                leftChevronIcon: Icon(
+                  Icons.chevron_left,
+                  color: headerAccentColor,
+                ),
+                rightChevronIcon: Icon(
+                  Icons.chevron_right,
+                  color: headerAccentColor,
+                ),
+              ),
+              daysOfWeekStyle: DaysOfWeekStyle(
+                weekdayStyle: TextStyle(
+                  color: isDark ? Colors.white70 : Colors.black87,
+                ),
+                weekendStyle: TextStyle(
+                  color: isDark ? Colors.red[300] : Colors.red[600],
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
   Future<void> leaveGroup(int groupId, int sessionId) async {
@@ -1258,86 +2154,164 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
           children: sessions.map((session) {
             final sessionGroups = groups.where((group) => group['sessionId'] == session['id']).toList();
             final currentGroupsForSession = currentGroups[session['id']] ?? [];
+            final sessionId = session['id'];
+            
+            developer.log('📊 Affichage sessionId: $sessionId - Nombre de groupes à afficher: ${sessionGroups.length}', name: 'GroupsPage');
+            developer.log('📊 État pagination - currentPage: ${_currentPage[sessionId]}, hasMorePages: ${_hasMorePages[sessionId]}, isLoadingMore: ${_isLoadingMore[sessionId]}', name: 'GroupsPage');
+
+            // Initialiser les structures pour cette session si nécessaire
+            if (!_focusedDays.containsKey(sessionId)) {
+              _focusedDays[sessionId] = DateTime.now();
+              _selectedDays[sessionId] = null;
+              _sessionEvents[sessionId] = {};
+              _isLoadingCalendar[sessionId] = false;
+              _loadedMonths[sessionId] = {};
+            }
+            
+            // Initialiser le ScrollController pour cette session si nécessaire
+            if (!_scrollControllers.containsKey(sessionId)) {
+              _scrollControllers[sessionId] = ScrollController();
+              if (!_currentPage.containsKey(sessionId)) {
+                _currentPage[sessionId] = 1;
+              }
+              if (!_hasMorePages.containsKey(sessionId)) {
+                _hasMorePages[sessionId] = true;
+              }
+              if (!_isLoadingMore.containsKey(sessionId)) {
+                _isLoadingMore[sessionId] = false;
+              }
+            }
+            
+            // Charger les événements du calendrier pour cette session si nécessaire
+            // Le premier calendrier est déjà chargé dans _checkAuthAndFetchData
+            // Pour les autres sessions, charger en arrière-plan sans loader
+            if (!_loadedMonths.containsKey(sessionId) || _loadedMonths[sessionId]!.isEmpty) {
+              // Charger le mois actuel sans priorité (en arrière-plan)
+              _fetchSessionCalendarEvents(sessionId, isPriority: false);
+              // Charger les autres mois en arrière-plan après un court délai
+              Future.delayed(const Duration(milliseconds: 300), () {
+                if (mounted) {
+                  _loadOtherMonthsInBackground(sessionId);
+                }
+              });
+            }
 
             return RefreshIndicator(
-              onRefresh: refreshData,
-              child: Padding(
-                padding: const EdgeInsets.all(16.0),
-                child: sessionGroups.isEmpty
-                    ? SingleChildScrollView(
+              onRefresh: () async {
+                // Réinitialiser la pagination lors du refresh
+                if (_currentPage.containsKey(sessionId)) {
+                  _currentPage[sessionId] = 1;
+                  _hasMorePages[sessionId] = true;
+                }
+                await refreshData();
+                // Recharger le calendrier après le refresh
+                if (_loadedMonths.containsKey(sessionId)) {
+                  _loadedMonths[sessionId]!.clear();
+                }
+                _fetchSessionCalendarEvents(sessionId, isPriority: true);
+              },
+              child: NotificationListener<ScrollNotification>(
+                onNotification: (ScrollNotification scrollInfo) {
+                  // Détecter quand on atteint la fin du scroll
+                  final pixels = scrollInfo.metrics.pixels;
+                  final maxScrollExtent = scrollInfo.metrics.maxScrollExtent;
+                  final threshold = maxScrollExtent - 200;
+                  
+                  developer.log('📜 Scroll détecté - pixels: $pixels, maxScrollExtent: $maxScrollExtent, threshold: $threshold', name: 'GroupsPage');
+                  developer.log('📜 hasMorePages: ${_hasMorePages[sessionId]}, isLoadingMore: ${_isLoadingMore[sessionId]}', name: 'GroupsPage');
+                  
+                  if (pixels >= threshold) {
+                    developer.log('📜 Seuil atteint! Vérification des conditions...', name: 'GroupsPage');
+                    if (_hasMorePages[sessionId] == true && 
+                        _isLoadingMore[sessionId] != true) {
+                      developer.log('📜 ✅ Conditions remplies, appel de loadMoreGroups pour sessionId: $sessionId', name: 'GroupsPage');
+                      loadMoreGroups(sessionId);
+                    } else {
+                      developer.log('📜 ❌ Conditions non remplies - hasMorePages: ${_hasMorePages[sessionId]}, isLoadingMore: ${_isLoadingMore[sessionId]}', name: 'GroupsPage');
+                    }
+                  }
+                  return false;
+                },
+                child: SingleChildScrollView(
+                  controller: _scrollControllers[sessionId],
                   physics: const AlwaysScrollableScrollPhysics(),
-                  child: SizedBox(
-                    height: MediaQuery.of(context).size.height * 0.8,
-                    child: Center(
-                      child: Text(
-                        'Aucun groupe disponible',
-                        style: theme.textTheme.bodyLarge,
-                      ),
-                    ),
-                  ),
-                )
-                    : ListView.builder(
-                  itemCount: sessionGroups.length,
-                  itemBuilder: (context, index) {
-                    final group = sessionGroups[index];
-                    final progress = (group['members'] as int) / (group['capacity'] as int);
-                    final isGroupFull = (group['members'] as int) >= (group['capacity'] as int);
-                    final canLeaveGroup = group['joined'] == true &&
-                        group['specialGroupStatus'] == true &&
-                        group['type'] != 'Normal';
-
-                    return FutureBuilder<bool?>(
-                      future: authProvider.getPendingChange(session['id'], group['groupId']),
-                      builder: (context, changeSnapshot) {
-                        return FutureBuilder<bool?>(
-                          future: authProvider.getPendingJoin(session['id'], group['groupId']),
-                          builder: (context, joinSnapshot) {
-                            final isPendingChange = changeSnapshot.data ?? false;
-                            final isPendingJoin = joinSnapshot.data ?? false;
-
-                            return Card(
-                              margin: const EdgeInsets.only(bottom: 16.0),
-                              shape: RoundedRectangleBorder(
-                                borderRadius: BorderRadius.circular(16.0),
+                  child: Padding(
+                    padding: const EdgeInsets.all(16.0),
+                    child: Column(
+                      children: [
+                        // Calendrier pour cette session
+                        _buildSessionCalendar(sessionId),
+                        // Liste des groupes
+                        if (sessionGroups.isEmpty)
+                          SizedBox(
+                            height: MediaQuery.of(context).size.height * 0.4,
+                            child: Center(
+                              child: Text(
+                                'Aucun groupe disponible',
+                                style: theme.textTheme.bodyLarge,
                               ),
-                              color: theme.cardColor,
-                              elevation: 3,
-                              child: Padding(
-                                padding: const EdgeInsets.all(16.0),
-                                child: Stack(
-                                  children: [
-                                    Column(
-                                      crossAxisAlignment: CrossAxisAlignment.start,
-                                      children: [
-                                        Text(
-                                          group['name'],
-                                          style: theme.textTheme.titleMedium?.copyWith(
-                                            fontWeight: FontWeight.bold,
-                                          ) ?? const TextStyle(
-                                            fontWeight: FontWeight.bold,
-                                            fontSize: 18.0,
-                                          ),
-                                        ),
-                                        const SizedBox(height: 4.0),
-                                        Text(
-                                          '${group['teacher']} • ${group['subject']}',
-                                          style: theme.textTheme.bodyMedium,
-                                        ),
-                                        const SizedBox(height: 12.0),
-                                        ClipRRect(
-                                          borderRadius: BorderRadius.circular(8.0),
-                                          child: LinearProgressIndicator(
-                                            value: progress,
-                                            backgroundColor: isDark ? Colors.grey[700] : Colors.deepPurple.shade100,
-                                            color: theme.primaryColor,
-                                            minHeight: 6.0,
-                                          ),
-                                        ),
-                                        const SizedBox(height: 4.0),
-                                        Align(
-                                          alignment: Alignment.centerRight,
-                                          child: Text(
-                                            'Capacité: ${group['capacity']} - ${group['members']} membres',
+                            ),
+                          )
+                        else
+                          ...sessionGroups.map((group) {
+                          final progress = (group['members'] as int) / (group['capacity'] as int);
+                          final isGroupFull = (group['members'] as int) >= (group['capacity'] as int);
+                          final canLeaveGroup = group['joined'] == true &&
+                              group['specialGroupStatus'] == true &&
+                              group['type'] != 'Normal';
+
+                          return FutureBuilder<bool?>(
+                            future: authProvider.getPendingChange(sessionId, group['groupId']),
+                            builder: (context, changeSnapshot) {
+                              return FutureBuilder<bool?>(
+                                future: authProvider.getPendingJoin(sessionId, group['groupId']),
+                                builder: (context, joinSnapshot) {
+                                  final isPendingChange = changeSnapshot.data ?? false;
+                                  final isPendingJoin = joinSnapshot.data ?? false;
+
+                                  return Card(
+                                    margin: const EdgeInsets.only(bottom: 16.0),
+                                    shape: RoundedRectangleBorder(
+                                      borderRadius: BorderRadius.circular(16.0),
+                                    ),
+                                    color: theme.cardColor,
+                                    elevation: 3,
+                                    child: Padding(
+                                      padding: const EdgeInsets.all(16.0),
+                                      child: Stack(
+                                        children: [
+                                          Column(
+                                            crossAxisAlignment: CrossAxisAlignment.start,
+                                            children: [
+                                              Text(
+                                                group['name'],
+                                                style: theme.textTheme.titleMedium?.copyWith(
+                                                  fontWeight: FontWeight.bold,
+                                                ) ?? const TextStyle(
+                                                  fontWeight: FontWeight.bold,
+                                                  fontSize: 18.0,
+                                                ),
+                                              ),
+                                              const SizedBox(height: 4.0),
+                                              Text(
+                                                '${group['teacher']} • ${group['subject']}',
+                                                style: theme.textTheme.bodyMedium,
+                                              ),
+                                              const SizedBox(height: 12.0),
+                                              ClipRRect(
+                                                borderRadius: BorderRadius.circular(8.0),
+                                                child: LinearProgressIndicator(
+                                                  value: progress,
+                                                  backgroundColor: isDark ? Colors.grey[700] : Colors.deepPurple.shade100,
+                                                  color: theme.primaryColor,
+                                                  minHeight: 6.0,
+                                                ),
+                                              ),
+                                              const SizedBox(height: 4.0),
+                                              Align(
+                                                alignment: Alignment.centerRight,
+                                                child: Text(
+                                                  'Capacité: ${group['capacity']} - ${group['members']} membres',
                                             style: theme.textTheme.bodyMedium,
                                           ),
                                         ),
@@ -1562,21 +2536,6 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
                                           ),
                                       ],
                                     ),
-                                    Positioned(
-                                      top: 0,
-                                      right: 0,
-                                      child: IconButton(
-                                        icon: Icon(
-                                          Icons.calendar_month,
-                                          color: isDark ? Colors.white70 : Colors.grey[600],
-                                        ),
-                                        onPressed: () => showGroupCalendarDialog(
-                                          group['name'],
-                                          group['groupId'],
-                                          group['sessionId'],
-                                        ),
-                                      ),
-                                    ),
                                   ],
                                 ),
                               ),
@@ -1585,8 +2544,19 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
                         );
                       },
                     );
-                  },
+                  }).toList(),
+                      // Indicateur de chargement pour la pagination
+                      if (_isLoadingMore[sessionId] == true)
+                        const Padding(
+                          padding: EdgeInsets.all(16.0),
+                          child: Center(
+                            child: CircularProgressIndicator(),
+                          ),
+                        ),
+                    ],
+                  ),
                 ),
+              ),
               ),
             );
           }).toList(),

@@ -71,7 +71,7 @@ class PrivacyPolicyPage extends StatelessWidget {
                 ),
                 const SizedBox(height: 8),
                 Text(
-                  'Dernière mise à jour : 21 novembre 2024',
+                  'Dernière mise à jour : ${DateTime.now().day} ${['janvier', 'février', 'mars', 'avril', 'mai', 'juin', 'juillet', 'août', 'septembre', 'octobre', 'novembre', 'décembre'][DateTime.now().month - 1]} ${DateTime.now().year}',
                   style: TextStyle(
                     fontSize: 16,
                     color: isDark ? Colors.grey[300] : Colors.grey[700],

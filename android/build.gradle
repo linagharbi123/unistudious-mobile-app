@@ -1,5 +1,14 @@
 buildscript {
-    ext.kotlin_version = '2.1.0'
+    ext {
+        kotlin_version = '2.1.0'
+
+        // 🔥 IMPORTANT POUR GOOGLE PLAY (16 KB FIX)
+        compileSdkVersion = 35
+        targetSdkVersion = 35
+        minSdkVersion = 26
+        ndkVersion = "26.1.10909125"
+    }
+
     repositories {
         google()
         mavenCentral()
@@ -8,9 +17,6 @@ buildscript {
     dependencies {
         classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlin_version"
         classpath 'com.android.tools.build:gradle:8.7.2'
-        // Note: we n'utilisons pas Firebase ici, donc le plugin Google Services
-        // (com.google.gms:google-services) n'est pas nécessaire et a été retiré
-        // pour éviter l'obligation d'un fichier google-services.json.
     }
 }
 
@@ -22,15 +28,38 @@ allprojects {
     }
 }
 
-
 rootProject.buildDir = '../build'
 
 subprojects {
     project.buildDir = "${rootProject.buildDir}/${project.name}"
-}
 
-subprojects {
-    project.evaluationDependsOn(':app')
+    afterEvaluate { project ->
+        if (project.hasProperty('android')) {
+            project.android {
+
+                // 🔥 IMPORTANT
+                compileSdkVersion rootProject.ext.compileSdkVersion
+
+                defaultConfig {
+                    minSdkVersion rootProject.ext.minSdkVersion
+                    targetSdkVersion rootProject.ext.targetSdkVersion
+                }
+
+                compileOptions {
+                    sourceCompatibility JavaVersion.VERSION_17
+                    targetCompatibility JavaVersion.VERSION_17
+                }
+
+                ndkVersion rootProject.ext.ndkVersion
+            }
+        }
+
+        tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile).configureEach {
+            kotlinOptions {
+                jvmTarget = "17"
+            }
+        }
+    }
 }
 
 tasks.register("clean", Delete) {

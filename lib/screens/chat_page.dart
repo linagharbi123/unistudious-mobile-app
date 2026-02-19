@@ -29,6 +29,7 @@ import 'package:cached_network_image/cached_network_image.dart';
 import 'package:video_player/video_player.dart';
 
 import 'package:audioplayers/audioplayers.dart';
+import 'package:just_audio/just_audio.dart' as just_audio;
 import 'package:record/record.dart';
 import 'package:flutter_pdfview/flutter_pdfview.dart';
 
@@ -882,6 +883,40 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
     });
   }
 
+  /// Marque tous les messages non lus comme lus
+  void _markMessagesAsRead() {
+    if (!mounted) return;
+    
+    bool hasChanges = false;
+    setState(() {
+      for (var i = 0; i < messages.length; i++) {
+        if (messages[i]['isUnread'] == true) {
+          messages[i]['isUnread'] = false;
+          hasChanges = true;
+        }
+      }
+    });
+    
+    if (hasChanges) {
+      // Mettre à jour le cache
+      SharedPreferences.getInstance().then((prefs) {
+        if (roomId != null) {
+          final cached = prefs.getString('messages_cache_$roomId');
+          if (cached != null) {
+            final data = jsonDecode(cached);
+            final cacheMessages = data['messages'] as List;
+            for (var i = 0; i < cacheMessages.length; i++) {
+              if (cacheMessages[i]['isUnread'] == true) {
+                cacheMessages[i]['isUnread'] = false;
+              }
+            }
+            prefs.setString('messages_cache_$roomId', jsonEncode(data));
+          }
+        }
+      });
+    }
+  }
+
   Map<String, dynamic> _convertWebSocketMessageToUI(Map<String, dynamic> wsMsg) {
     // Le message WebSocket est déjà dans le bon format grâce au service
     // On s'assure juste qu'il a tous les champs nécessaires
@@ -909,6 +944,9 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
       };
     }
 
+    // Déterminer si le message est non lu (pas envoyé par l'utilisateur actuel)
+    final isUnread = wsMsg['username'] != currentUser && wsMsg['isSent'] != true;
+    
     return {
       'id': wsMsg['id'],
       'text': wsMsg['text'] ?? '',
@@ -925,6 +963,7 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
       'reactions': wsMsg['reactions'] ?? {},
       'isSent': wsMsg['isSent'] ?? false,
       'isUpdate': wsMsg['isUpdate'] ?? false, // Préserver le flag de mise à jour
+      'isUnread': isUnread, // Flag pour les messages non lus
       'threadMessages': wsMsg['threadMessages'] ?? [],
       'threadCount': wsMsg['threadCount'] ?? 0,
       'threadLastMessage': wsMsg['threadLastMessage'],
@@ -1027,6 +1066,11 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
 
             // Ensuite, enrichir les replyTo avec les données des messages originaux
             messages = tempMessages.map((msg) {
+              // Déterminer si le message est non lu (pas envoyé par l'utilisateur actuel)
+              final msgUsername = msg['username']?.toString() ?? '';
+              final isUnread = msgUsername != currentUser && msg['isSent'] != true;
+              msg['isUnread'] = isUnread;
+              
               // Gérer replyTo : convertir tmid en objet avec les données du message original
               if (msg['tmid'] != null) {
                 final tmid = msg['tmid'].toString();
@@ -1127,6 +1171,9 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
       await fetchUsers();
 
       await fetchMessages();
+      
+      // Marquer les messages comme lus quand la conversation est ouverte
+      _markMessagesAsRead();
 
     } catch (e, stackTrace) {
 
@@ -2124,6 +2171,8 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
       }
 
       final tempDir = await getTemporaryDirectory();
+      // IMPORTANT : iOS/macOS ne supporte pas l'enregistrement AAC dans un conteneur .mp3 via le plugin `record`.
+      // On reste donc en .m4a (AAC dans un conteneur compatible) pour éviter l'erreur OSStatus.
       final path = '${tempDir.path}/voice_${DateTime.now().millisecondsSinceEpoch}.m4a';
 
       await _audioRecorder.start(
@@ -2165,6 +2214,8 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
       if (!await file.exists()) return;
 
       final bytes = await file.readAsBytes();
+      // Même remarque : on envoie le fichier tel qu'il est enregistré, en .m4a.
+      // Si vous avez besoin de MP3, il faudra convertir côté serveur ou avec un autre outil.
       final fileName = 'vocal_${DateTime.now().millisecondsSinceEpoch}.m4a';
 
       await _sendAudioAttachment(bytes, fileName);
@@ -4577,14 +4628,27 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
     final fileId = message['file']?['_id']?.toString() ??
         message['files']?[0]?['_id']?.toString();
 
-    final name = fileName ?? 'audio';
+    // Toujours utiliser en priorité le vrai nom de fichier retourné par Rocket.Chat,
+    // car l'API /api/chat/read/file a besoin du nom exact pour autoriser l'accès.
+    final rcFileName = message['file']?['name']?.toString() ??
+        message['files']?[0]?['name']?.toString();
 
+    final nameForApi = rcFileName ?? fileName ?? 'audio';
+    final nameForDisplay = fileName ?? rcFileName ?? 'audio';
+
+    final audioKey = ValueKey('audio_${message['_id'] ?? message['id'] ?? fileId ?? audioUrl}');
+
+    // Cas où on n'a pas d'ID de fichier → on utilise directement l'URL (ancienne méthode)
     if (fileId == null) {
-      return _AudioPlayerWidget(audioUrl: audioUrl, fileName: name, isDark: isDark);
+      final fullUrl = _getFullUrl(audioUrl);
+      final enrichedUrl = _enrichUrlWithRcTokens(fullUrl, message);
+      return _AudioPlayerWidget(key: audioKey, audioUrl: enrichedUrl, fileName: nameForDisplay, isDark: isDark);
     }
 
+    // Cas avec fileId → on essaie d'abord l'API /api/chat/read/file
     return FutureBuilder<String?>(
-      future: _getPlayableFileUrl(fileId: fileId, fileName: name),
+      key: audioKey,
+      future: _getPlayableFileUrl(fileId: fileId, fileName: nameForApi),
       builder: (context, snapshot) {
         if (snapshot.connectionState == ConnectionState.waiting) {
           return Container(
@@ -4594,18 +4658,16 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
         }
 
         final path = snapshot.data;
+
+        // Si l'API échoue (null), on retombe sur l'URL enrichie Rocket.Chat comme fallback
         if (path == null) {
-          return Container(
-            padding: const EdgeInsets.all(12),
-            decoration: BoxDecoration(
-              color: isDark ? Colors.red[900] : Colors.red[100],
-              borderRadius: BorderRadius.circular(12),
-            ),
-            child: const Text('Erreur de chargement audio', style: TextStyle(color: Colors.white)),
-          );
+          final fullUrl = _getFullUrl(audioUrl);
+          final enrichedUrl = _enrichUrlWithRcTokens(fullUrl, message);
+          return _AudioPlayerWidget(key: audioKey, audioUrl: enrichedUrl, fileName: nameForDisplay, isDark: isDark);
         }
 
-        return _AudioPlayerWidget(audioUrl: path, fileName: name, isDark: isDark);
+        // Succès de /api/chat/read/file → lecture du fichier local
+        return _AudioPlayerWidget(key: audioKey, audioUrl: path, fileName: nameForDisplay, isDark: isDark);
       },
     );
   }
@@ -4955,7 +5017,18 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
 
     final isDark = theme.brightness == Brightness.dark;
 
-    return GestureDetector(
+    return WillPopScope(
+
+      onWillPop: () async {
+
+        Navigator.pop(context);
+
+        // On retourne false car on gère nous‑mêmes le pop
+        return false;
+
+      },
+
+      child: GestureDetector(
 
       onTap: () {
 
@@ -4969,7 +5042,7 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
 
       },
 
-      child: Scaffold(
+        child: Scaffold(
 
         appBar: AppBar(
 
@@ -5763,7 +5836,11 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
 
                                                             text: message['text'] ?? '',
 
-                                                            style: GoogleFonts.poppins(color: isDark ? Colors.white : Colors.black87, fontSize: 15),
+                                                            style: GoogleFonts.poppins(
+                                                              color: isDark ? Colors.white : Colors.black87, 
+                                                              fontSize: 15,
+                                                              fontWeight: message['isUnread'] == true ? FontWeight.bold : FontWeight.normal,
+                                                            ),
 
                                                           ),
 
@@ -6859,6 +6936,8 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
 
         ),
 
+        ),
+
       ),
 
     );
@@ -6870,53 +6949,35 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
 // Widget pour afficher un lecteur audio dans le chat
 
 class _AudioPlayerWidget extends StatefulWidget {
-
   final String audioUrl;
-
   final String fileName;
-
   final bool isDark;
 
   const _AudioPlayerWidget({
-
+    super.key,
     required this.audioUrl,
-
     required this.fileName,
-
     required this.isDark,
-
   });
 
   @override
-
   State<_AudioPlayerWidget> createState() => _AudioPlayerWidgetState();
-
 }
 
 class _AudioPlayerWidgetState extends State<_AudioPlayerWidget> {
-
   late AudioPlayer _audioPlayer;
-
+  Source? _audioSource; // Pour rejouer après completion (resume() ne fonctionne pas)
   bool _isPlaying = false;
-
-  Duration _duration = Duration.zero;
-
-  Duration _position = Duration.zero;
-
   bool _isInitialized = false;
-  
+  Duration _duration = Duration.zero;
+  Duration _position = Duration.zero;
   String? _errorMessage;
 
   @override
-
   void initState() {
-
     super.initState();
-
     _audioPlayer = AudioPlayer();
-
     _initializeAudio();
-
   }
 
   Future<void> _initializeAudio() async {
@@ -6942,41 +7003,130 @@ class _AudioPlayerWidgetState extends State<_AudioPlayerWidget> {
       final isLocalFile = !rawUrl.startsWith('http');
 
       if (isLocalFile) {
-        // Pour les fichiers locaux, utiliser DeviceFileSource
-        await _audioPlayer.setSource(DeviceFileSource(rawUrl));
-      } else {
-        // Pour certaines URLs (Rocket.Chat /file-upload/), AVPlayer peut échouer.
-        // Dans ce cas, on télécharge d'abord le fichier puis on le lit en local.
-        if (rawUrl.contains('message.unistudious.com/file-upload/') || 
-            rawUrl.contains('/file-upload/')) {
-          final prefs = await SharedPreferences.getInstance();
-          final token = prefs.getString('auth_token') ?? '';
-          
-          final uri = Uri.parse(rawUrl);
-          final headers = <String, String>{};
-          if (token.isNotEmpty) {
-            headers['Authorization'] = 'Bearer $token';
+        // Pour les fichiers locaux, vérifier que le fichier existe et utiliser DeviceFileSource
+        final localFile = io.File(rawUrl);
+        if (!await localFile.exists()) {
+          throw Exception('Le fichier audio local n\'existe pas: $rawUrl');
+        }
+        
+        // Vérifier la taille du fichier
+        final fileSize = await localFile.length();
+        if (fileSize == 0) {
+          throw Exception('Le fichier audio local est vide (0 bytes): $rawUrl');
+        }
+        
+        // Vérifier que le fichier est lisible
+        try {
+          final testBytes = await localFile.readAsBytes();
+          if (testBytes.isEmpty) {
+            throw Exception('Le fichier audio local ne peut pas être lu: $rawUrl');
           }
           
-          final response = await http.get(uri, headers: headers).timeout(const Duration(seconds: 30));
+          // Vérifier que ce n'est pas du HTML/JSON d'erreur
+          if (testBytes.length >= 100) {
+            final textStart = String.fromCharCodes(testBytes.take(100));
+            if (textStart.toLowerCase().contains('<html') || 
+                textStart.toLowerCase().contains('<!doctype') ||
+                textStart.toLowerCase().contains('{"error')) {
+              throw Exception('Le fichier local contient du HTML/JSON au lieu d\'un fichier audio: $rawUrl');
+            }
+          }
+        } catch (e) {
+          developer.log('Erreur lors de la vérification du fichier local: $e', name: 'AudioPlayerWidget', error: e);
+          throw Exception('Le fichier audio local est corrompu ou inaccessible: $e');
+        }
+        
+        developer.log('Lecture fichier local: $rawUrl (${fileSize} bytes)', name: 'AudioPlayerWidget');
+        
+        // Utiliser DeviceFileSource avec le chemin absolu
+        _audioSource = DeviceFileSource(localFile.absolute.path);
+        await _audioPlayer.setSource(_audioSource!);
+      } else {
+        final uri = Uri.parse(rawUrl);
+
+        // Téléchargement direct de l'URL protégée.
+        // Sur iOS, AVPlayer peut avoir des problèmes avec certains formats M4A/MP3 depuis des URLs distantes.
+        // On télécharge toujours le fichier sur iOS avant de le lire pour garantir la compatibilité.
+        // Sur Android, on télécharge aussi pour les URLs Rocket.Chat, sinon on utilise setSourceUrl.
+        final shouldDownload = io.Platform.isIOS ||
+            rawUrl.contains('message.unistudious.com/file-upload/') ||
+            rawUrl.contains('/file-upload/');
+
+        if (shouldDownload) {
+          developer.log('Téléchargement audio pour iOS/Android: $rawUrl', name: 'AudioPlayerWidget');
+          final headers = <String, String>{};
+
+          // Vérifier si l'URL contient déjà les tokens Rocket.Chat
+          final hasRcToken = uri.queryParameters.containsKey('rc_token');
+          final hasRcUid = uri.queryParameters.containsKey('rc_uid');
+
+          // Pour les URLs Rocket.Chat avec rc_token/rc_uid, ne pas ajouter de header Authorization
+          // Ces tokens dans l'URL sont suffisants pour l'authentification Rocket.Chat
+          // Ajouter un header Bearer peut causer un conflit et retourner 403
+          if (!hasRcToken || !hasRcUid) {
+            final prefs = await SharedPreferences.getInstance();
+            final token = prefs.getString('auth_token') ?? '';
+            if (token.isNotEmpty) {
+              headers['Authorization'] = 'Bearer $token';
+            }
+          } else {
+            developer.log(
+              'URL contient déjà les tokens Rocket.Chat, pas de header Authorization ajouté',
+              name: 'AudioPlayerWidget',
+            );
+          }
+
+          final response =
+              await http.get(uri, headers: headers).timeout(const Duration(seconds: 30));
           if (response.statusCode != 200) {
             throw Exception('HTTP ${response.statusCode} lors du chargement de l\'audio');
           }
 
           final tempDir = await getTemporaryDirectory();
-          final fileNameFromUrl = uri.pathSegments.isNotEmpty
-              ? uri.pathSegments.last
-              : '${DateTime.now().millisecondsSinceEpoch}.m4a';
-          final sanitizedName = fileNameFromUrl.replaceAll('/', '_').replaceAll('\\', '_');
+          // Extraire l'extension du nom de fichier ou de l'URL
+          String extension = '.m4a'; // Par défaut
+          if (widget.fileName.isNotEmpty) {
+            final dotIndex = widget.fileName.lastIndexOf('.');
+            if (dotIndex > 0 && dotIndex < widget.fileName.length - 1) {
+              extension = widget.fileName.substring(dotIndex);
+            }
+          } else {
+            final fileNameFromUrl = uri.pathSegments.isNotEmpty
+                ? uri.pathSegments.last
+                : '';
+            if (fileNameFromUrl.isNotEmpty) {
+              final dotIndex = fileNameFromUrl.lastIndexOf('.');
+              if (dotIndex > 0 && dotIndex < fileNameFromUrl.length - 1) {
+                extension = fileNameFromUrl.substring(dotIndex);
+              }
+            }
+          }
+
+          final sanitizedName = widget.fileName.isNotEmpty
+              ? widget.fileName.replaceAll('/', '_').replaceAll('\\', '_')
+              : 'audio_${DateTime.now().millisecondsSinceEpoch}$extension';
           final tempFile = io.File(
             '${tempDir.path}/chat_audio_${DateTime.now().millisecondsSinceEpoch}_$sanitizedName',
           );
           await tempFile.writeAsBytes(response.bodyBytes);
 
-          await _audioPlayer.setSource(DeviceFileSource(tempFile.path));
+          developer.log('Fichier audio téléchargé: ${tempFile.path}', name: 'AudioPlayerWidget');
+          _audioSource = DeviceFileSource(tempFile.path);
+          await _audioPlayer.setSource(_audioSource!);
         } else {
-          // Pour les autres URLs classiques, utiliser setSourceUrl directement
-          await _audioPlayer.setSourceUrl(rawUrl);
+          // Pour les autres URLs classiques sur Android uniquement, utiliser setSourceUrl directement
+          // Sur iOS, on ne devrait jamais arriver ici grâce à la condition shouldDownload
+          if (io.Platform.isIOS) {
+            developer.log(
+              'ERREUR: Tentative d\'utiliser setSourceUrl sur iOS pour: $rawUrl',
+              name: 'AudioPlayerWidget',
+            );
+            throw Exception(
+              'iOS ne supporte pas setSourceUrl pour cette URL. Le téléchargement devrait avoir été effectué.',
+            );
+          }
+          _audioSource = UrlSource(rawUrl);
+          await _audioPlayer.setSource(_audioSource!);
         }
       }
 
@@ -7018,6 +7168,7 @@ class _AudioPlayerWidgetState extends State<_AudioPlayerWidget> {
         developer.log(
           'Erreur bénigne "Bad state: No element" ignorée pendant l\'init audio',
           name: 'AudioPlayerWidget',
+          error: e,
         );
         if (mounted && !_isInitialized) {
           setState(() {
@@ -7029,40 +7180,48 @@ class _AudioPlayerWidgetState extends State<_AudioPlayerWidget> {
 
       developer.log('Error initializing audio: $e', name: 'AudioPlayerWidget', error: e);
       if (mounted) {
+        String userFriendly = 'Erreur lors du chargement de l\'audio';
+        final errorText2 = e.toString();
+        if (errorText2.contains('HTTP 403') || errorText2.contains('403')) {
+          userFriendly =
+              'Impossible de lire ce fichier audio pour le moment. Réessayez plus tard ou contactez le support.';
+        } else if (errorText2.contains('HTTP') || errorText2.contains('timeout')) {
+          userFriendly =
+              'Erreur de téléchargement du fichier audio. Vérifiez votre connexion internet.';
+        }
+
         setState(() {
-          _errorMessage = 'Erreur lors du chargement de l\'audio: $e';
-          _isInitialized = true; // Pour permettre l'affichage même en cas d'erreur
+          _errorMessage = userFriendly;
+          _isInitialized = true; // Pour permettre l'affichage de l'erreur
         });
       }
     }
   }
 
   @override
-
   void dispose() {
-
     _audioPlayer.dispose();
-
     super.dispose();
-
   }
 
-  void _togglePlayPause() {
-
+  Future<void> _togglePlayPause() async {
     if (_isPlaying) {
-
-      _audioPlayer.pause();
-
+      await _audioPlayer.pause();
     } else {
+      // Quand l'audio est terminé (completed), resume() ne fonctionne pas - il faut appeler play() avec la source
+      final state = _audioPlayer.state;
+      final isCompleted = state == PlayerState.completed ||
+          (_duration > Duration.zero && _position >= _duration - const Duration(milliseconds: 500));
 
-      _audioPlayer.resume();
-
+      if (isCompleted && _audioSource != null) {
+        await _audioPlayer.play(_audioSource!);
+      } else {
+        await _audioPlayer.resume();
+      }
     }
-
   }
 
   @override
-
   Widget build(BuildContext context) {
     // Si erreur, afficher le message d'erreur
     if (_errorMessage != null) {
@@ -7084,137 +7243,74 @@ class _AudioPlayerWidgetState extends State<_AudioPlayerWidget> {
     }
 
     return Container(
-
       width: MediaQuery.of(context).size.width * 0.6,
-
       padding: const EdgeInsets.all(12),
-
       decoration: BoxDecoration(
         // Couleurs distinctes pour mieux ressortir en dark/light
         color: widget.isDark ? Colors.grey[850] : Colors.grey[300],
         borderRadius: BorderRadius.circular(12),
       ),
-
       child: Row(
-
         children: [
-
           IconButton(
-
             icon: Icon(_isPlaying ? Icons.pause : Icons.play_arrow),
-
             onPressed: _isInitialized ? _togglePlayPause : null,
-
             color: widget.isDark ? Colors.white : Colors.black87,
-
           ),
-
           Expanded(
-
             child: Column(
-
               crossAxisAlignment: CrossAxisAlignment.start,
-
               mainAxisSize: MainAxisSize.min,
-
               children: [
-
                 Text(
-
                   widget.fileName,
-
                   style: GoogleFonts.poppins(
-
                     color: widget.isDark ? Colors.white : Colors.black87,
-
                     fontSize: 14,
-
                     fontWeight: FontWeight.w500,
-
                   ),
-
                   maxLines: 1,
-
                   overflow: TextOverflow.ellipsis,
-
                 ),
-
                 const SizedBox(height: 4),
-
                 if (_isInitialized && _duration != Duration.zero)
-
                   Row(
-
                     children: [
-
                       Expanded(
-
                         child: Slider(
-
                           value: _position.inSeconds.toDouble(),
-
                           min: 0,
-
                           max: _duration.inSeconds.toDouble(),
-
                           onChanged: (value) {
-
                             _audioPlayer.seek(Duration(seconds: value.toInt()));
-
                           },
-
                         ),
-
                       ),
-
                       Text(
-
                         '${_formatDuration(_position)} / ${_formatDuration(_duration)}',
-
                         style: GoogleFonts.poppins(
-
                           color: widget.isDark ? Colors.white70 : Colors.black54,
-
                           fontSize: 10,
-
                         ),
-
                       ),
-
                     ],
-
                   )
-
                 else
-
                   const SizedBox(height: 8),
-
               ],
-
             ),
-
           ),
-
         ],
-
       ),
-
     );
-
   }
 
   String _formatDuration(Duration duration) {
-
     String twoDigits(int n) => n.toString().padLeft(2, '0');
-
     final minutes = twoDigits(duration.inMinutes.remainder(60));
-
     final seconds = twoDigits(duration.inSeconds.remainder(60));
-
     return '$minutes:$seconds';
-
   }
-
 }
 
 // Screen pour afficher une image en plein écran
@@ -7617,12 +7713,12 @@ class _PdfViewerScreen extends StatelessWidget {
   }
 }
 
-// API qui récupère le fichier via /api/chat/read/file et le sauve en local
+// API qui récupère le fichier audio via /api/chat/read/file-audio et le sauve en local
 Future<String?> _getPlayableFileUrl({
   required String fileId,
   required String fileName,
 }) async {
-  const endpoint = 'https://www.unistudious.com/api/chat/read/file';
+  const endpoint = 'https://www.unistudious.com/api/chat/read/file-audio';
 
   try {
     final prefs = await SharedPreferences.getInstance();
@@ -7634,22 +7730,123 @@ Future<String?> _getPlayableFileUrl({
       ..fields['fileName'] = fileName
       ..headers['Authorization'] = 'Bearer $token';
 
-    final response = await request.send().timeout(const Duration(seconds: 30));
+    final streamedResponse =
+        await request.send().timeout(const Duration(seconds: 30));
 
-    if (response.statusCode == 200) {
-      final bytes = await response.stream.toBytes();
+    final statusCode = streamedResponse.statusCode;
+    final rawBody = await streamedResponse.stream.bytesToString();
+
+    if (statusCode == 200) {
+      Map<String, dynamic> json;
+      try {
+        json = jsonDecode(rawBody) as Map<String, dynamic>;
+      } catch (e) {
+        developer.log(
+          'Erreur de parsing JSON pour read/file-audio: $e, body: $rawBody',
+          name: 'ChatPage.Media',
+        );
+        return null;
+      }
+
+      final success = json['success'] == true;
+      final fileBase64 = json['fileBase64'] as String?;
+      final serverFileName = (json['fileName'] as String?) ?? fileName;
+
+      if (!success || fileBase64 == null || fileBase64.isEmpty) {
+        developer.log(
+          'read/file-audio a répondu sans fichier utilisable: success=$success, fileBase64 length=${fileBase64?.length ?? 0}',
+          name: 'ChatPage.Media',
+        );
+        return null;
+      }
+
+      Uint8List bytes;
+      try {
+        bytes = base64Decode(fileBase64);
+      } catch (e) {
+        developer.log(
+          'Erreur de décodage base64 pour read/file-audio: $e',
+          name: 'ChatPage.Media',
+        );
+        return null;
+      }
+
       final tempDir = await getTemporaryDirectory();
-      final tempFile = io.File('${tempDir.path}/chat_media_${fileId}_${DateTime.now().millisecondsSinceEpoch}');
+
+      // Conserver le nom/extension retournés par l'API (important pour iOS/AVPlayer)
+      final sanitizedName =
+          serverFileName.replaceAll('/', '_').replaceAll('\\', '_');
+      final tempFile = io.File(
+        '${tempDir.path}/chat_media_${fileId}_${DateTime.now().millisecondsSinceEpoch}_$sanitizedName',
+      );
+
       await tempFile.writeAsBytes(bytes);
-      developer.log('Fichier temporaire créé : ${tempFile.path}', name: 'ChatPage.Media');
+      
+      // Attendre un peu pour s'assurer que le fichier est complètement écrit
+      await Future.delayed(const Duration(milliseconds: 100));
+      
+      // Vérifier que le fichier existe et a une taille valide
+      if (!await tempFile.exists()) {
+        developer.log(
+          'Le fichier temporaire n\'existe pas après écriture: ${tempFile.path}',
+          name: 'ChatPage.Media',
+        );
+        return null;
+      }
+      
+      final fileSize = await tempFile.length();
+      if (fileSize == 0) {
+        developer.log(
+          'Le fichier temporaire est vide (0 bytes): ${tempFile.path}',
+          name: 'ChatPage.Media',
+        );
+        return null;
+      }
+      
+      if (fileSize != bytes.length) {
+        developer.log(
+          'ATTENTION: Taille du fichier sur disque ($fileSize) différente de la taille décodée (${bytes.length})',
+          name: 'ChatPage.Media',
+        );
+      }
+      
+      // Vérifier les premiers bytes pour s'assurer que c'est un fichier audio valide (M4A commence par certains bytes)
+      if (bytes.length >= 4) {
+        final firstBytes = bytes.take(4).toList();
+        // M4A/MP4 commence généralement par des bytes spécifiques (ftyp box à l'offset 4)
+        // Vérifier au moins que ce n'est pas du texte/HTML
+        final textStart = String.fromCharCodes(bytes.take(100));
+        if (textStart.toLowerCase().contains('<html') || 
+            textStart.toLowerCase().contains('<!doctype') ||
+            textStart.toLowerCase().contains('error') ||
+            textStart.toLowerCase().contains('{"error')) {
+          developer.log(
+            'Le serveur a retourné du HTML/JSON d\'erreur au lieu d\'un fichier audio',
+            name: 'ChatPage.Media',
+          );
+          return null;
+        }
+      }
+      
+      developer.log(
+        'Fichier audio temporaire créé via read/file-audio : ${tempFile.path} (${fileSize} bytes)',
+        name: 'ChatPage.Media',
+      );
       return tempFile.path;
     } else {
-      final errorBody = await response.stream.bytesToString();
-      developer.log('Erreur read/file : ${response.statusCode} $errorBody', name: 'ChatPage.Media');
+      developer.log(
+        'Erreur read/file-audio : $statusCode $rawBody',
+        name: 'ChatPage.Media',
+      );
       return null;
     }
   } catch (e, s) {
-    developer.log('Exception dans _getPlayableFileUrl: $e', name: 'ChatPage.Media', error: e, stackTrace: s);
+    developer.log(
+      'Exception dans _getPlayableFileUrl: $e',
+      name: 'ChatPage.Media',
+      error: e,
+      stackTrace: s,
+    );
     return null;
   }
 }

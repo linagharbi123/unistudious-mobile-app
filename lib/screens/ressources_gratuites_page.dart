@@ -26,7 +26,8 @@ class Course {
   final int id;
   final String name;
   final String type;
-  final CreatedAt createdAt;
+  final String createdAt;
+  final String filePath;
   final Account account;
   final String image;
   final List<Tag> tags;
@@ -37,6 +38,7 @@ class Course {
     required this.name,
     required this.type,
     required this.createdAt,
+    required this.filePath,
     required this.account,
     required this.image,
     required this.tags,
@@ -44,15 +46,52 @@ class Course {
   });
 
   factory Course.fromJson(Map<String, dynamic> json) {
+    // Helper function to safely parse Map from potentially String value
+    Map<String, dynamic> safeMap(dynamic value) {
+      if (value is Map<String, dynamic>) {
+        return value;
+      } else if (value is Map) {
+        return Map<String, dynamic>.from(value);
+      } else {
+        return {};
+      }
+    }
+
+    // Helper function to safely parse List of Maps
+    List<Map<String, dynamic>> safeListOfMaps(dynamic value) {
+      if (value is List) {
+        return value.whereType<Map>().map((item) {
+          if (item is Map<String, dynamic>) {
+            return item;
+          } else if (item is Map) {
+            return Map<String, dynamic>.from(item);
+          } else {
+            return <String, dynamic>{};
+          }
+        }).toList();
+      }
+      return [];
+    }
+
+    // Handle createdAt as either string or object
+    String createdAtString = '';
+    if (json['createdAt'] is String) {
+      createdAtString = json['createdAt'] as String;
+    } else if (json['createdAt'] is Map) {
+      final createdAtObj = CreatedAt.fromJson(safeMap(json['createdAt']));
+      createdAtString = createdAtObj.date;
+    }
+
     return Course(
       id: json['id'] ?? 0,
       name: json['name'] ?? 'N/A',
       type: json['type'] ?? 'N/A',
-      createdAt: CreatedAt.fromJson(json['createdAt'] ?? {}),
-      account: Account.fromJson(json['account'] ?? {}),
+      createdAt: createdAtString,
+      filePath: json['filePath'] ?? '',
+      account: Account.fromJson(safeMap(json['account'])),
       image: json['image'] ?? '',
-      tags: (json['tags'] as List<dynamic>? ?? []).map((tag) => Tag.fromJson(tag)).toList(),
-      subjects: (json['subjects'] as List<dynamic>? ?? []).map((subject) => Subject.fromJson(subject)).toList(),
+      tags: safeListOfMaps(json['tags']).map((tag) => Tag.fromJson(tag)).toList(),
+      subjects: safeListOfMaps(json['subjects']).map((subject) => Subject.fromJson(subject)).toList(),
     );
   }
 }
@@ -145,37 +184,44 @@ class CourseDetails {
     required this.allTags,
   });
 
-  factory CourseDetails.fromJson(Map<String, dynamic> json) {
+  factory CourseDetails.fromJson(Map<String, dynamic> json, {String? currentPath}) {
+    // New API structure: folders and files are directly in the response
     return CourseDetails(
-      relativeFolderPath: json['allData']?['relativeFolderPath'] ?? '',
-      folders: (json['allData']?['folders'] as List<dynamic>? ?? []).map((folder) => Folder.fromJson(folder)).toList(),
-      files: (json['allData']?['files'] as List<dynamic>? ?? []).map((file) => ResourceFile.fromJson(file)).toList(),
-      url: json['allData']?['url'] ?? '',
-      subjects: (json['subjects'] as List<dynamic>? ?? []).map((subject) => Subject.fromJson(subject)).toList(),
-      allTags: json['allTags'] ?? {},
+      relativeFolderPath: currentPath ?? '',
+      folders: (json['folders'] as List<dynamic>? ?? []).map((folder) => Folder.fromJson(folder)).toList(),
+      files: (json['files'] as List<dynamic>? ?? []).map((file) => ResourceFile.fromJson(file)).toList(),
+      url: '',
+      subjects: [],
+      allTags: {},
     );
   }
 }
 
 class Folder {
+  final String id;
   final String name;
-  final String url;
-  final bool isFolder;
-  final String cleanId;
+  final String createdAt;
+  final String createdAtIndex;
+  final int itemsCount;
+  final double totalSize;
 
   Folder({
+    required this.id,
     required this.name,
-    required this.url,
-    required this.isFolder,
-    required this.cleanId,
+    required this.createdAt,
+    required this.createdAtIndex,
+    required this.itemsCount,
+    required this.totalSize,
   });
 
   factory Folder.fromJson(Map<String, dynamic> json) {
     return Folder(
+      id: json['id'] ?? '',
       name: json['name'] ?? 'N/A',
-      url: json['url'] ?? '',
-      isFolder: json['is_folder'] ?? false,
-      cleanId: json['cleanId'] ?? '',
+      createdAt: json['createdAt'] ?? '',
+      createdAtIndex: json['createdAtIndex'] ?? '',
+      itemsCount: (json['itemsCount'] as num?)?.toInt() ?? 0,
+      totalSize: (json['totalSize'] as num?)?.toDouble() ?? 0.0,
     );
   }
 }
@@ -253,7 +299,7 @@ class _RessourcesGratuitesPageState extends State<RessourcesGratuitesPage> {
 
     try {
       if (selectedCourse != null) {
-        await _fetchCourseDetails(selectedCourse!.id, folderPath: currentFolderPath);
+        await _fetchCourseDetails(currentFolderPath ?? selectedCourse!.filePath);
       } else {
         await _fetchCourses();
       }
@@ -338,7 +384,7 @@ class _RessourcesGratuitesPageState extends State<RessourcesGratuitesPage> {
       }
 
       final response = await http.get(
-        Uri.parse('https://www.unistudious.com/free-course-mobile'),
+        Uri.parse('https://www.unistudious.com/api/free-course-mobile'),
         headers: {
           'Authorization': 'Bearer ${authProvider.token}',
           'Content-Type': 'application/json',
@@ -349,9 +395,37 @@ class _RessourcesGratuitesPageState extends State<RessourcesGratuitesPage> {
 
       developer.log('API response: ${response.statusCode} - ${response.body}', name: 'FetchCourses');
       if (response.statusCode == 200) {
-        final List<dynamic> data = jsonDecode(response.body);
+        final decodedData = jsonDecode(response.body);
+        
+        // Handle different response formats
+        List<dynamic> data;
+        if (decodedData is List) {
+          data = decodedData;
+        } else if (decodedData is Map && decodedData.containsKey('data')) {
+          data = decodedData['data'] is List ? decodedData['data'] : [];
+        } else {
+          developer.log('Unexpected response format: $decodedData', name: 'FetchCourses');
+          data = [];
+        }
+        
+        // Safely parse courses, filtering out invalid entries
+        final parsedCourses = <Course>[];
+        for (var item in data) {
+          try {
+            if (item is Map<String, dynamic>) {
+              parsedCourses.add(Course.fromJson(item));
+            } else if (item is Map) {
+              parsedCourses.add(Course.fromJson(Map<String, dynamic>.from(item)));
+            } else {
+              developer.log('Skipping invalid course item: $item', name: 'FetchCourses');
+            }
+          } catch (e) {
+            developer.log('Error parsing course item: $e', name: 'FetchCourses');
+          }
+        }
+        
         setState(() {
-          courses = data.map((json) => Course.fromJson(json)).toList();
+          courses = parsedCourses;
           isLoading = false;
           isConnectionError = false;
         });
@@ -403,7 +477,7 @@ class _RessourcesGratuitesPageState extends State<RessourcesGratuitesPage> {
     }
   }
 
-  Future<void> _fetchCourseDetails(int courseId, {String? folderPath}) async {
+  Future<void> _fetchCourseDetails(String filePath) async {
     if (!mounted) return;
 
     setState(() {
@@ -411,7 +485,7 @@ class _RessourcesGratuitesPageState extends State<RessourcesGratuitesPage> {
       errorMessage = null;
       isConnectionError = false;
     });
-    developer.log('Fetching course details for courseId: $courseId, folderPath: $folderPath', name: 'FetchCourseDetails');
+    developer.log('Fetching course details for filePath: $filePath', name: 'FetchCourseDetails');
 
     try {
       final authProvider = Provider.of<AuthProvider>(context, listen: false);
@@ -427,13 +501,14 @@ class _RessourcesGratuitesPageState extends State<RessourcesGratuitesPage> {
         return;
       }
 
-      final response = await http.post(
-        Uri.parse('https://www.unistudious.com/free-course-list-mobile/$courseId'),
+      // Encode the filePath for URL (handle special characters)
+      final encodedFilePath = Uri.encodeComponent(filePath);
+      final response = await http.get(
+        Uri.parse('https://www.unistudious.com/api/free-course-list-mobile/$encodedFilePath'),
         headers: {
           'Authorization': 'Bearer ${authProvider.token}',
           'Content-Type': 'application/json',
         },
-        body: folderPath != null ? jsonEncode({'folderPath': folderPath}) : null,
       );
 
       if (!mounted) return;
@@ -442,8 +517,8 @@ class _RessourcesGratuitesPageState extends State<RessourcesGratuitesPage> {
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body);
         setState(() {
-          courseDetails = CourseDetails.fromJson(data);
-          currentFolderPath = folderPath ?? courseDetails!.relativeFolderPath;
+          courseDetails = CourseDetails.fromJson(data, currentPath: filePath);
+          currentFolderPath = filePath;
           isLoading = false;
           isConnectionError = false;
         });
@@ -661,39 +736,36 @@ class _RessourcesGratuitesPageState extends State<RessourcesGratuitesPage> {
     final folderMap = <String, dynamic>{};
 
     folderMap[details.relativeFolderPath] = {
-      'name': details.relativeFolderPath.replaceAll(RegExp(r'/$'), ''),
-      'url': details.relativeFolderPath,
+      'name': details.relativeFolderPath.split('/').where((p) => p.isNotEmpty).lastOrNull ?? 'Root',
+      'id': details.relativeFolderPath,
       'subfolders': [],
       'files': [],
-      'courseId': selectedCourse!.id,
     };
 
     for (var folder in details.folders) {
-      final pathParts = folder.url.split('/').where((part) => part.isNotEmpty).toList();
+      final pathParts = folder.id.split('/').where((part) => part.isNotEmpty).toList();
       if (pathParts.length > 1) {
-        final parentPath = pathParts.sublist(0, pathParts.length - 1).join('/');
+        final parentPath = pathParts.sublist(0, pathParts.length - 1).join('/') + '/';
         final currentFolder = {
-          'name': folder.name.replaceAll(RegExp(r'/$'), ''),
-          'url': folder.url,
+          'name': folder.name,
+          'id': folder.id,
           'subfolders': [],
           'files': [],
-          'courseId': selectedCourse!.id,
         };
-        folderMap[folder.url] = currentFolder;
-        if (folderMap.containsKey(parentPath + '/')) {
-          folderMap[parentPath + '/']['subfolders'].add(currentFolder);
+        folderMap[folder.id] = currentFolder;
+        if (folderMap.containsKey(parentPath)) {
+          folderMap[parentPath]['subfolders'].add(currentFolder);
         } else {
           folderMap[details.relativeFolderPath]['subfolders'].add(currentFolder);
         }
       } else {
-        folderMap[folder.url] = {
-          'name': folder.name.replaceAll(RegExp(r'/$'), ''),
-          'url': folder.url,
+        folderMap[folder.id] = {
+          'name': folder.name,
+          'id': folder.id,
           'subfolders': [],
           'files': [],
-          'courseId': selectedCourse!.id,
         };
-        folderMap[details.relativeFolderPath]['subfolders'].add(folderMap[folder.url]);
+        folderMap[details.relativeFolderPath]['subfolders'].add(folderMap[folder.id]);
       }
     }
 
@@ -752,15 +824,11 @@ class _RessourcesGratuitesPageState extends State<RessourcesGratuitesPage> {
   }
 
   String _constructFolderUrl(String folderPath) {
-    final pathParts = folderPath.split('/').where((part) => part.isNotEmpty).toList();
-    final folderName = pathParts.isNotEmpty ? pathParts.last : '';
-    final encodedFolderName = Uri.encodeComponent(folderName.replaceAll(' ', '-'));
-
-    if (folderPath == courseDetails?.relativeFolderPath) {
-      return 'https://unistudious.com/free-course-list/${selectedCourse!.id}';
-    } else {
-      return 'https://unistudious.com/free-course-folder/${selectedCourse!.id}/$encodedFolderName';
+    // For the new API, we can construct a URL based on the filePath
+    if (selectedCourse != null) {
+      return 'https://unistudious.com/api/free-course-list-mobile/${Uri.encodeComponent(folderPath)}';
     }
+    return '';
   }
 
   Future<void> _openFile(ResourceFile file) async {
@@ -776,6 +844,32 @@ class _RessourcesGratuitesPageState extends State<RessourcesGratuitesPage> {
 
     developer.log('Attempting to open file: $fileName, type: $fileType, url: $fileUrl', name: 'OpenFile');
 
+    final videoExtensions = ['mp4', 'mov', 'avi', 'mkv', 'wmv'];
+    final imageExtensions = ['jpg', 'jpeg', 'png', 'gif', 'bmp'];
+    final audioExtensions = ['mp3', 'wav', 'ogg', 'm4a'];
+    final pdfExtensions = ['pdf'];
+
+    final extension = fileName.split('.').last.toLowerCase();
+    final isVideo = videoExtensions.contains(extension) || fileType == 'VIDÉOS';
+    final isImage = imageExtensions.contains(extension) || fileType == 'IMAGES';
+    final isAudio = audioExtensions.contains(extension) || fileType == 'AUDIO';
+    final isPdf = pdfExtensions.contains(extension) || fileType == 'PDF';
+
+    // For PDFs, use the API directly, skip URL validation
+    if (isPdf) {
+      developer.log('Opening PDF file: $fileName', name: 'OpenFile');
+      await _openPdfFromApi(file);
+      return;
+    }
+
+    // For videos, use the API directly, skip URL validation
+    if (isVideo) {
+      developer.log('Opening video file: $fileName', name: 'OpenFile');
+      await _openVideoFromApi(file);
+      return;
+    }
+
+    // For other file types, validate URL
     if (!_validateFileUrl(fileUrl, fileName)) {
       setState(() {
         isLoading = false;
@@ -794,27 +888,8 @@ class _RessourcesGratuitesPageState extends State<RessourcesGratuitesPage> {
       return;
     }
 
-    final videoExtensions = ['mp4', 'mov', 'avi', 'mkv', 'wmv'];
-    final imageExtensions = ['jpg', 'jpeg', 'png', 'gif', 'bmp'];
-    final audioExtensions = ['mp3', 'wav', 'ogg', 'm4a'];
-    final pdfExtensions = ['pdf'];
-
-    final extension = fileName.split('.').last.toLowerCase();
-    final isVideo = videoExtensions.contains(extension) || fileType == 'VIDÉOS';
-    final isImage = imageExtensions.contains(extension) || fileType == 'IMAGES';
-    final isAudio = audioExtensions.contains(extension) || fileType == 'AUDIO';
-    final isPdf = pdfExtensions.contains(extension) || fileType == 'PDF';
-
     try {
-      if (isVideo) {
-        developer.log('Opening video file: $fileName', name: 'OpenFile');
-        Navigator.push(
-          context,
-          MaterialPageRoute(
-            builder: (context) => VideoPlayerScreen(filePath: fileUrl, isNetwork: true),
-          ),
-        );
-      } else if (isImage) {
+      if (isImage) {
         developer.log('Opening image file: $fileName', name: 'OpenFile');
         Navigator.push(
           context,
@@ -830,9 +905,6 @@ class _RessourcesGratuitesPageState extends State<RessourcesGratuitesPage> {
             builder: (context) => AudioPlayerScreen(audioUrl: fileUrl, fileName: fileName),
           ),
         );
-      } else if (isPdf) {
-        developer.log('Opening PDF file: $fileName', name: 'OpenFile');
-        await _openFileFallback(file, isPdf: true);
       } else {
         developer.log('Attempting to open unsupported file type with fallback: $fileName', name: 'OpenFile');
         await _openFileFallback(file);
@@ -855,6 +927,195 @@ class _RessourcesGratuitesPageState extends State<RessourcesGratuitesPage> {
       setState(() {
         isLoading = false;
       });
+    }
+  }
+
+  Future<void> _openPdfFromApi(ResourceFile file) async {
+    try {
+      setState(() {
+        isLoading = true;
+      });
+
+      final authProvider = Provider.of<AuthProvider>(context, listen: false);
+      if (authProvider.token == null) {
+        developer.log('No authentication token found', name: 'ReadFileFromApi');
+        if (mounted) {
+          setState(() {
+            isLoading = false;
+            errorMessage = 'Erreur d\'authentification. Veuillez vous reconnecter.';
+          });
+          Navigator.pushReplacementNamed(context, '/login');
+        }
+        return;
+      }
+
+      developer.log('Reading file from API: ${file.id}', name: 'ReadFileFromApi');
+      final response = await http.post(
+        Uri.parse('https://www.unistudious.com/api/share-resource/read-file'),
+        headers: {
+          'Authorization': 'Bearer ${authProvider.token}',
+          'Content-Type': 'application/json',
+        },
+        body: jsonEncode({'id': file.id}),
+      );
+
+      if (!mounted) return;
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        final content = data['content'] as String?;
+        
+        if (content == null || content.isEmpty) {
+          throw Exception('Contenu du fichier vide');
+        }
+
+        // Decode base64 content
+        final fileBytes = base64Decode(content);
+        
+        // Save to temporary file
+        final tempDir = await getTemporaryDirectory();
+        final fileName = _sanitizeFileName(file.name);
+        final filePath = '${tempDir.path}/$fileName';
+        final tempFile = io.File(filePath);
+
+        await tempFile.parent.create(recursive: true);
+        await tempFile.writeAsBytes(fileBytes);
+
+        if (!await tempFile.exists()) {
+          throw Exception('Le fichier n\'a pas pu être créé.');
+        }
+
+        developer.log('PDF file saved to: $filePath', name: 'ReadFileFromApi');
+        
+        if (mounted) {
+          await Navigator.push(
+            context,
+            MaterialPageRoute(
+              builder: (context) => PDFViewerScreen(filePath: filePath, fileName: file.name),
+            ),
+          );
+          await tempFile.delete();
+        }
+      } else if (response.statusCode == 401) {
+        developer.log('Authentication error: 401 Unauthorized', name: 'ReadFileFromApi');
+        if (mounted) {
+          setState(() {
+            isLoading = false;
+            errorMessage = 'Erreur d\'authentification. Veuillez vous reconnecter.';
+          });
+          Navigator.pushReplacementNamed(context, '/login');
+        }
+      } else {
+        developer.log('Unexpected status code: ${response.statusCode}', name: 'ReadFileFromApi');
+        throw Exception('Erreur lors de la lecture du fichier: ${response.statusCode}');
+      }
+    } catch (e) {
+      developer.log('Error reading file from API: $e', name: 'ReadFileFromApi');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              'Erreur lors de la lecture du fichier: $e',
+              style: GoogleFonts.poppins(fontSize: 14),
+            ),
+            backgroundColor: Colors.red.shade100,
+            behavior: SnackBarBehavior.floating,
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+          ),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          isLoading = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _openVideoFromApi(ResourceFile file) async {
+    try {
+      setState(() {
+        isLoading = true;
+      });
+
+      final authProvider = Provider.of<AuthProvider>(context, listen: false);
+      if (authProvider.token == null) {
+        developer.log('No authentication token found', name: 'ReadVideoFromApi');
+        if (mounted) {
+          setState(() {
+            isLoading = false;
+            errorMessage = 'Erreur d\'authentification. Veuillez vous reconnecter.';
+          });
+          Navigator.pushReplacementNamed(context, '/login');
+        }
+        return;
+      }
+
+      developer.log('Reading video file from API: ${file.id}', name: 'ReadVideoFromApi');
+      final response = await http.post(
+        Uri.parse('https://www.unistudious.com/api/share-resource/read-file-video'),
+        headers: {
+          'Authorization': 'Bearer ${authProvider.token}',
+          'Content-Type': 'application/json',
+        },
+        body: jsonEncode({'id': file.id}),
+      );
+
+      if (!mounted) return;
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        final videoLink = data['link'] as String?;
+        
+        if (videoLink == null || videoLink.isEmpty) {
+          throw Exception('Lien vidéo vide');
+        }
+
+        developer.log('Video link retrieved: $videoLink', name: 'ReadVideoFromApi');
+        
+        if (mounted) {
+          Navigator.push(
+            context,
+            MaterialPageRoute(
+              builder: (context) => VideoPlayerScreen(filePath: videoLink, isNetwork: true),
+            ),
+          );
+        }
+      } else if (response.statusCode == 401) {
+        developer.log('Authentication error: 401 Unauthorized', name: 'ReadVideoFromApi');
+        if (mounted) {
+          setState(() {
+            isLoading = false;
+            errorMessage = 'Erreur d\'authentification. Veuillez vous reconnecter.';
+          });
+          Navigator.pushReplacementNamed(context, '/login');
+        }
+      } else {
+        developer.log('Unexpected status code: ${response.statusCode}', name: 'ReadVideoFromApi');
+        throw Exception('Erreur lors de la lecture de la vidéo: ${response.statusCode}');
+      }
+    } catch (e) {
+      developer.log('Error reading video from API: $e', name: 'ReadVideoFromApi');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              'Erreur lors de la lecture de la vidéo: $e',
+              style: GoogleFonts.poppins(fontSize: 14),
+            ),
+            backgroundColor: Colors.red.shade100,
+            behavior: SnackBarBehavior.floating,
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+          ),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          isLoading = false;
+        });
+      }
     }
   }
 
@@ -997,76 +1258,106 @@ class _RessourcesGratuitesPageState extends State<RessourcesGratuitesPage> {
       content = _buildCentersList();
     }
 
-    return Scaffold(
-      backgroundColor: isDark ? theme.scaffoldBackgroundColor : Colors.grey.shade50,
-      appBar: AppBar(
-        leading: selectedAccount != null || selectedCourse != null
-            ? IconButton(
-          icon: Icon(Icons.arrow_back, color: Colors.white),
-          onPressed: () {
-            setState(() {
-              if (currentFolderPath != null) {
-                final pathSegments = currentFolderPath!.split('/').where((s) => s.isNotEmpty).toList();
-                if (pathSegments.isEmpty || currentFolderPath == courseDetails?.relativeFolderPath) {
-                  selectedCourse = null;
-                  courseDetails = null;
-                  currentFolderPath = null;
-                } else {
-                  pathSegments.removeLast();
-                  final newPath = pathSegments.isEmpty ? null : '${pathSegments.join('/')}/';
-                  developer.log('Navigating to folder: $newPath', name: 'Navigation');
-                  currentFolderPath = newPath;
-                  _fetchCourseDetails(selectedCourse!.id, folderPath: newPath);
-                }
-              } else if (selectedCourse != null) {
-                selectedCourse = null;
-                courseDetails = null;
-                currentFolderPath = null;
-              } else if (selectedAccount != null) {
-                selectedAccount = null;
-              }
-            });
-          },
-        )
-            : Builder(
-          builder: (context) {
-            return IconButton(
-              icon: Icon(Icons.menu, color: theme.appBarTheme.iconTheme?.color ?? Colors.white),
-              onPressed: () => Scaffold.of(context).openDrawer(),
-            );
-          },
-        ),
-        title: Text(
-          selectedCourse != null
-              ? selectedCourse!.name
-              : selectedAccount != null
-              ? selectedAccount!
-              : "Centres d'étude",
-          style: GoogleFonts.poppins(
-            fontSize: 20,
-            color: Colors.white,
+    // Gestion commune du "retour" (physique / système / flèche AppBar)
+    void handleInPageBack() {
+      setState(() {
+        if (currentFolderPath != null) {
+          // On est dans un sous-dossier d'un cours : remonter d'un niveau
+          final pathSegments = currentFolderPath!
+              .split('/')
+              .where((s) => s.isNotEmpty)
+              .toList();
+
+          if (pathSegments.isEmpty ||
+              currentFolderPath == selectedCourse?.filePath) {
+            // On est au dossier racine du cours : revenir à la liste des cours
+            selectedCourse = null;
+            courseDetails = null;
+            currentFolderPath = null;
+          } else {
+            // Remonter d'un dossier dans l'arborescence
+            pathSegments.removeLast();
+            final newPath =
+                pathSegments.isEmpty ? selectedCourse?.filePath : '${pathSegments.join('/')}/';
+            developer.log('Navigating to folder: $newPath',
+                name: 'Navigation');
+            currentFolderPath = newPath;
+            if (newPath != null && selectedCourse != null) {
+              _fetchCourseDetails(newPath);
+            }
+          }
+        } else if (selectedCourse != null) {
+          // On quitte les détails du cours pour revenir à la liste des cours du centre
+          selectedCourse = null;
+          courseDetails = null;
+          currentFolderPath = null;
+        } else if (selectedAccount != null) {
+          // On quitte la liste des cours pour revenir à la liste des centres
+          selectedAccount = null;
+        }
+      });
+    }
+
+    return WillPopScope(
+      onWillPop: () async {
+        if (selectedAccount != null || selectedCourse != null || currentFolderPath != null) {
+          // Gérer le retour à l'intérieur de la page (centre → cours → dossiers)
+          handleInPageBack();
+          return false; // Empêche la fermeture immédiate de la page
+        }
+        // Si rien n'est sélectionné, laisser Flutter gérer le pop normal (retour écran précédent)
+        return true;
+      },
+      child: Scaffold(
+        backgroundColor: isDark ? theme.scaffoldBackgroundColor : Colors.grey.shade50,
+        appBar: AppBar(
+          leading: selectedAccount != null || selectedCourse != null
+              ? IconButton(
+                  icon: Icon(Icons.arrow_back, color: Colors.white),
+                  onPressed: () {
+                    // Utiliser la même logique que pour le bouton "retour" système
+                    handleInPageBack();
+                  },
+                )
+              : Builder(
+                  builder: (context) {
+                    return IconButton(
+                      icon: Icon(Icons.menu, color: theme.appBarTheme.iconTheme?.color ?? Colors.white),
+                      onPressed: () => Scaffold.of(context).openDrawer(),
+                    );
+                  },
+                ),
+          title: Text(
+            selectedCourse != null
+                ? selectedCourse!.name
+                : selectedAccount != null
+                    ? selectedAccount!
+                    : "Centres d'étude",
+            style: GoogleFonts.poppins(
+              fontSize: 20,
+              color: Colors.white,
+            ),
           ),
-        ),
-        centerTitle: false, // Aligne le titre à gauche
-        backgroundColor: Colors.transparent,
-        elevation: 0,
-        flexibleSpace: Container(
-          decoration: BoxDecoration(
-            gradient: LinearGradient(
-              colors: isDark
-                  ? const [Color(0xFF1A003D), Color(0xFF3C0D73)]
-                  : const [Color(0xFF8E2DE2), Color(0xFF4A00E0)],
-              begin: Alignment.topLeft,
-              end: Alignment.bottomRight,
+          centerTitle: false, // Aligne le titre à gauche
+          backgroundColor: Colors.transparent,
+          elevation: 0,
+          flexibleSpace: Container(
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                colors: isDark
+                    ? const [Color(0xFF1A003D), Color(0xFF3C0D73)]
+                    : const [Color(0xFF8E2DE2), Color(0xFF4A00E0)],
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+              ),
             ),
           ),
         ),
-      ),
-      drawer: const AppSidebar(),
-      body: isLoading
-          ? Center(child: CircularProgressIndicator(color: Colors.deepPurple))
-          : isConnectionError
-          ? Center(
+        drawer: const AppSidebar(),
+        body: isLoading
+            ? Center(child: CircularProgressIndicator(color: Colors.deepPurple))
+            : isConnectionError
+                ? Center(
               child: Column(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
@@ -1115,7 +1406,7 @@ class _RessourcesGratuitesPageState extends State<RessourcesGratuitesPage> {
                         isConnectionError = false;
                       });
                       if (selectedCourse != null) {
-                        _fetchCourseDetails(selectedCourse!.id, folderPath: currentFolderPath);
+                        _fetchCourseDetails(currentFolderPath ?? selectedCourse!.filePath);
                       } else {
                         _fetchCourses();
                       }
@@ -1157,6 +1448,7 @@ class _RessourcesGratuitesPageState extends State<RessourcesGratuitesPage> {
           : RefreshIndicator(
         onRefresh: _refresh,
         child: content,
+      ),
       ),
     );
   }
@@ -1253,7 +1545,7 @@ class _RessourcesGratuitesPageState extends State<RessourcesGratuitesPage> {
                                   Icon(Icons.calendar_today, size: 16, color: theme.iconTheme.color),
                                   const SizedBox(width: 6),
                                   Text(
-                                    firstCourse.createdAt.date.split(' ')[0],
+                                    firstCourse.createdAt.split(' ')[0],
                                     style: GoogleFonts.poppins(
                                       fontSize: 13,
                                       color: theme.textTheme.bodyMedium?.color,
@@ -1353,10 +1645,10 @@ class _RessourcesGratuitesPageState extends State<RessourcesGratuitesPage> {
             setState(() {
               selectedCourse = course;
               courseDetails = null;
-              currentFolderPath = null;
+              currentFolderPath = course.filePath;
               developer.log('Selected course: ${course.name}', name: 'Selection');
             });
-            _fetchCourseDetails(course.id);
+            _fetchCourseDetails(course.filePath);
           },
           child: Card(
             color: theme.cardColor,
@@ -1402,7 +1694,7 @@ class _RessourcesGratuitesPageState extends State<RessourcesGratuitesPage> {
                                   Icon(Icons.calendar_today, size: 14, color: theme.iconTheme.color),
                                   const SizedBox(width: 6),
                                   Text(
-                                    course.createdAt.date.split(' ')[0],
+                                    course.createdAt.split(' ')[0],
                                     style: GoogleFonts.poppins(
                                       fontSize: 13,
                                       color: theme.textTheme.bodyMedium?.color,
@@ -1467,10 +1759,11 @@ class _RessourcesGratuitesPageState extends State<RessourcesGratuitesPage> {
 
     final folderTree = buildFolderTree(courseDetails!);
     dynamic currentFolder;
+    final rootPath = selectedCourse?.filePath ?? courseDetails!.relativeFolderPath;
     if (currentFolderPath != null && folderTree.containsKey(currentFolderPath)) {
       currentFolder = folderTree[currentFolderPath];
     } else {
-      currentFolder = folderTree[courseDetails!.relativeFolderPath];
+      currentFolder = folderTree[rootPath];
     }
 
     if (currentFolder == null || (currentFolder['subfolders'].isEmpty && currentFolder['files'].isEmpty)) {
@@ -1504,7 +1797,12 @@ class _RessourcesGratuitesPageState extends State<RessourcesGratuitesPage> {
     final widgets = <Widget>[];
 
     for (var file in folder['files']) {
-      final isValidUrl = _validateFileUrl(file.url, file.name);
+      final fileName = file.name.toLowerCase();
+      final isPdfFile = fileName.endsWith('.pdf');
+      final isVideoFile = fileName.endsWith('.mp4') || fileName.endsWith('.mov') || 
+                         fileName.endsWith('.avi') || fileName.endsWith('.mkv') || 
+                         fileName.endsWith('.wmv');
+      final isValidUrl = (isPdfFile || isVideoFile) ? true : _validateFileUrl(file.url, file.name);
       widgets.add(
         Card(
           color: theme.cardColor,
@@ -1618,7 +1916,8 @@ class _RessourcesGratuitesPageState extends State<RessourcesGratuitesPage> {
     }
 
     for (var subfolder in folder['subfolders']) {
-      final folderUrl = _constructFolderUrl(subfolder['url']);
+      final folderId = subfolder['id'] ?? subfolder['url'];
+      final folderUrl = _constructFolderUrl(folderId);
       widgets.add(
         Card(
           color: theme.cardColor,
@@ -1687,11 +1986,12 @@ class _RessourcesGratuitesPageState extends State<RessourcesGratuitesPage> {
             children: _buildFolderContent(subfolder),
             onExpansionChanged: (expanded) {
               if (expanded) {
+                final folderId = subfolder['id'] ?? subfolder['url'];
                 setState(() {
-                  currentFolderPath = subfolder['url'];
+                  currentFolderPath = folderId;
                   developer.log('Expanded folder: ${subfolder['name']}, new path: $currentFolderPath', name: 'Expansion');
                 });
-                _fetchCourseDetails(selectedCourse!.id, folderPath: subfolder['url']);
+                _fetchCourseDetails(folderId);
               }
             },
           ),
@@ -2031,7 +2331,29 @@ class _AudioPlayerScreenState extends State<AudioPlayerScreen> {
 
   Future<void> _initializeAudio() async {
     try {
-      await _audioPlayer.setSourceUrl(widget.audioUrl);
+      // Sur iOS, AVPlayer peut avoir des problèmes avec certains formats M4A/MP3 depuis des URLs distantes.
+      // On télécharge toujours le fichier sur iOS avant de le lire pour garantir la compatibilité.
+      if (io.Platform.isIOS) {
+        final uri = Uri.parse(widget.audioUrl);
+        final response = await http.get(uri).timeout(const Duration(seconds: 30));
+        if (response.statusCode != 200) {
+          throw Exception('HTTP ${response.statusCode} lors du chargement de l\'audio');
+        }
+
+        final tempDir = await getTemporaryDirectory();
+        final fileNameFromUrl = uri.pathSegments.isNotEmpty
+            ? uri.pathSegments.last
+            : '${DateTime.now().millisecondsSinceEpoch}.m4a';
+        final sanitizedName = fileNameFromUrl.replaceAll('/', '_').replaceAll('\\', '_');
+        final tempFile = io.File(
+          '${tempDir.path}/resource_audio_${DateTime.now().millisecondsSinceEpoch}_$sanitizedName',
+        );
+        await tempFile.writeAsBytes(response.bodyBytes);
+
+        await _audioPlayer.setSource(DeviceFileSource(tempFile.path));
+      } else {
+        await _audioPlayer.setSourceUrl(widget.audioUrl);
+      }
       _audioPlayer.onDurationChanged.listen((d) {
         if (mounted) {
           setState(() {
