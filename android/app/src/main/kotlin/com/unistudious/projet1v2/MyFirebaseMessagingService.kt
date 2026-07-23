@@ -1,5 +1,6 @@
 package com.unistudious.projet1v2
 
+import android.app.ActivityManager
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -34,6 +35,14 @@ class MyFirebaseMessagingService : FirebaseMessagingService() {
         Log.d(TAG, "Priority: ${remoteMessage.priority}")
         Log.d(TAG, "Original Priority: ${remoteMessage.originalPriority}")
         Log.d(TAG, "To: ${remoteMessage.to}")
+
+        // En foreground, Flutter affiche déjà la notif locale avec payload deep link.
+        // Éviter les doublons (2 notifications pour le même message).
+        if (isAppInForeground()) {
+            Log.d(TAG, "ℹ️ App en foreground → notification laissée à Flutter (évite doublon)")
+            Log.d(TAG, "═══════════════════════════════════════════════════════")
+            return
+        }
 
         // Vérifier si le message contient des données
         Log.d(TAG, "--- DATA PAYLOAD ---")
@@ -133,35 +142,53 @@ class MyFirebaseMessagingService : FirebaseMessagingService() {
             // comme click_action générique, qui NE DOIT PAS être utilisé comme route.
             val rawClickAction = data["click_action"] ?: clickAction
             val sanitizedClickAction = when (rawClickAction?.lowercase()) {
-                // Valeur par défaut utilisée par Firebase pour Flutter : on l'ignore
-                "flutter_notification_click" -> null
+                // Valeur technique Firebase Flutter → messagerie par défaut
+                "flutter_notification_click" -> "messagerie"
                 else -> rawClickAction
             }
 
             val redirectPath = data["redirect"]
+                ?: data["direction"]
                 ?: data["location"]
                 ?: data["route"]
-                ?: sanitizedClickAction  // Utiliser une vraie valeur métier en fallback
+                ?: data["action"]
+                ?: sanitizedClickAction
             if (redirectPath != null) {
                 val source = when {
                     data["redirect"] != null -> "données (redirect)"
+                    data["direction"] != null -> "données (direction)"
                     data["location"] != null -> "données (location)"
                     data["route"] != null -> "données (route)"
+                    data["action"] != null -> "données (action)"
                     sanitizedClickAction != null -> "click_action"
                     else -> "inconnu"
                 }
                 Log.d(TAG, "  📍 Paramètre redirect/location trouvé dans $source: '$redirectPath'")
             } else {
-                Log.d(TAG, "  ⚠️ Aucun paramètre redirect/location trouvé dans les données ni dans clickAction")
+                // Fallback messages sans redirect
+                val titleLower = title.lowercase()
+                if (titleLower.contains("message") || titleLower.contains("chat") || titleLower.contains("msg")) {
+                    Log.d(TAG, "  📍 Fallback message → messagerie (titre: $title)")
+                }
+                Log.d(TAG, "  ⚠️ Aucun paramètre redirect/direction/location trouvé dans les données ni dans clickAction")
+            }
+
+            val resolvedRedirect = redirectPath ?: run {
+                val titleLower = title.lowercase()
+                if (titleLower.contains("message") || titleLower.contains("chat") || titleLower.contains("msg")) {
+                    "messagerie"
+                } else {
+                    null
+                }
             }
             
             val intent = Intent(this, MainActivity::class.java).apply {
                 addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP)
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 // Passer le paramètre redirect/location dans l'Intent
-                if (redirectPath != null) {
-                    putExtra("redirect", redirectPath)
-                    Log.d(TAG, "  ✅ Paramètre redirect ajouté à l'Intent: '$redirectPath'")
+                if (resolvedRedirect != null) {
+                    putExtra("redirect", resolvedRedirect)
+                    Log.d(TAG, "  ✅ Paramètre redirect ajouté à l'Intent: '$resolvedRedirect'")
                 }
                 // Passer toutes les données de la notification pour que Flutter puisse les utiliser
                 data.forEach { (key, value) ->
@@ -220,6 +247,20 @@ class MyFirebaseMessagingService : FirebaseMessagingService() {
             Log.e(TAG, "  Exception: ${e.message}")
             Log.e(TAG, "  StackTrace: ${e.stackTraceToString()}")
         }
+    }
+
+    private fun isAppInForeground(): Boolean {
+        val activityManager = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+        val appProcesses = activityManager.runningAppProcesses ?: return false
+        val packageName = packageName
+        for (appProcess in appProcesses) {
+            if (appProcess.importance == ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND &&
+                appProcess.processName == packageName
+            ) {
+                return true
+            }
+        }
+        return false
     }
 
     companion object {

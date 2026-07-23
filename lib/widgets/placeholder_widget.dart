@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import '../utils/app_bar_gradient.dart';
 import '../widgets/sidebar.dart';
 
 class PlaceholderWidget extends StatelessWidget {
@@ -8,25 +9,27 @@ class PlaceholderWidget extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Theme(
-      data: Theme.of(context).copyWith(
-        appBarTheme: AppBarTheme(
-          backgroundColor: Colors.purple[900],
-          foregroundColor: Colors.white,
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+
+    return Scaffold(
+      appBar: AppBar(
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        foregroundColor: Colors.white,
+        iconTheme: const IconThemeData(color: Colors.white),
+        flexibleSpace: AppBarGradient.flexibleSpace(isDark),
+        title: Text(
+          title,
+          style: const TextStyle(color: Colors.white),
         ),
       ),
-      child: Scaffold(
-        appBar: AppBar(
-          title: Text(title),
-        ),
-        drawer: AppSidebar(),
-        body: Container(
-          color: Colors.white,
-          child: Center(
-            child: Text(
-              'Page "$title" à implémenter',
-              style: TextStyle(fontSize: 18, color: Colors.grey[600]),
-            ),
+      drawer: AppSidebar(),
+      body: Container(
+        color: Colors.white,
+        child: Center(
+          child: Text(
+            'Page "$title" à implémenter',
+            style: TextStyle(fontSize: 18, color: Colors.grey[600]),
           ),
         ),
       ),

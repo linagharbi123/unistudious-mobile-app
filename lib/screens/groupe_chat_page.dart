@@ -24,6 +24,7 @@ import 'dart:io' as io;
 import 'dart:typed_data';
 import 'dart:async';
 import '../providers/auth_provider.dart';
+import '../utils/app_bar_gradient.dart';
 import '../providers/loading_provider.dart';
 import '../utils/snackbar_helper.dart';
 import '../screens/group_info_page.dart';
@@ -4045,7 +4046,7 @@ class _GroupeChatPageState extends State<GroupeChatPage>
               gradient: LinearGradient(
                 colors: isDark
                     ? const [Color(0xFF1A003D), Color(0xFF3C0D73)]
-                    : const [Color(0xFF8E2DE2), Color(0xFF4A00E0)],
+                  : const [Color(0xFF8E2DE2), Color(0xFF4A00E0)],
                 begin: Alignment.topLeft,
                 end: Alignment.bottomRight,
               ),
@@ -5663,7 +5664,9 @@ class _ImageViewerScreen extends StatelessWidget {
     return Scaffold(
       backgroundColor: Colors.black,
       appBar: AppBar(
-        backgroundColor: Colors.black,
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        flexibleSpace: AppBarGradient.flexibleSpace(isDark),
         iconTheme: const IconThemeData(color: Colors.white),
         title: Text(
           'Image',
@@ -5839,9 +5842,15 @@ class _VideoPlayerScreenState extends State<_VideoPlayerScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
     return Scaffold(
       backgroundColor: Colors.black,
-      appBar: AppBar(backgroundColor: Colors.black, iconTheme: const IconThemeData(color: Colors.white)),
+      appBar: AppBar(
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        flexibleSpace: AppBarGradient.flexibleSpace(isDark),
+        iconTheme: const IconThemeData(color: Colors.white),
+      ),
       body: _errorMessage != null
           ? Center(child: Text(_errorMessage!, style: GoogleFonts.poppins(color: Colors.white)))
           : _isInitialized
@@ -5869,12 +5878,14 @@ class _PdfViewerScreen extends StatelessWidget {
     return Scaffold(
       backgroundColor: isDark ? Colors.grey[900] : Colors.grey[100],
       appBar: AppBar(
-        backgroundColor: isDark ? Colors.grey[900] : Colors.white,
-        iconTheme: IconThemeData(color: isDark ? Colors.white : Colors.black87),
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        flexibleSpace: AppBarGradient.flexibleSpace(isDark),
+        iconTheme: const IconThemeData(color: Colors.white),
         title: Text(
           fileName,
           style: GoogleFonts.poppins(
-            color: isDark ? Colors.white : Colors.black87,
+            color: Colors.white,
             fontSize: 16,
             fontWeight: FontWeight.w600,
           ),

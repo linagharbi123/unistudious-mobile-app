@@ -5,7 +5,6 @@ import 'dart:io';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:provider/provider.dart';
 import '../providers/auth_provider.dart';
-import '../providers/loading_provider.dart';
 import '../widgets/loading_wrapper.dart';
 import 'dart:developer' as developer;
 import 'dart:async';
@@ -15,6 +14,9 @@ import '../models/app_bar_provider.dart';
 import 'package:provider/provider.dart';
 import 'join_session_page.dart';
 import '../utils/connection_checker.dart';
+import '../services/page_cache_service.dart';
+import '../utils/session_status_cache.dart';
+import '../services/tutorial_service.dart';
 
 final double spacing = 8.0;
 
@@ -27,7 +29,7 @@ class DashboardPage extends StatefulWidget {
 
 class _DashboardPageState extends State<DashboardPage>
     with SingleTickerProviderStateMixin {
-  List<dynamic> centers = [];
+  List<dynamic> accounts = [];
   List<dynamic> sessions = [];
   int totalSessions = 0;
   int totalUsers = 0;
@@ -41,10 +43,10 @@ class _DashboardPageState extends State<DashboardPage>
   late Animation<double> _summaryFade;
   late Animation<Offset> _summarySlide;
 
-  // Ajout du ScrollController pour les centres
-  final ScrollController _centersScrollController = ScrollController();
-  int _currentCenterIndex = 0;
+  final ScrollController _accountsScrollController = ScrollController();
+  int _currentAccountIndex = 0;
   bool isConnectionError = false;
+  bool isLoading = true;
   Timer? _connectionCheckTimer;
 
   @override
@@ -82,15 +84,13 @@ class _DashboardPageState extends State<DashboardPage>
       ),
     );
 
-    // Écoute du scroll pour mettre à jour l'index actif
-    _centersScrollController.addListener(() {
-      if (centers.isEmpty) return;
-      final index = (_centersScrollController.offset / 336).round(); // 320 (card) + 16 (margin)
-      if (index != _currentCenterIndex && index >= 0 && index < centers.length) {
-        setState(() {
-          _currentCenterIndex = index;
-        });
-      }
+    _accountsScrollController.addListener(() {
+      _updateScrollIndex(
+        controller: _accountsScrollController,
+        itemCount: accounts.length,
+        currentIndex: _currentAccountIndex,
+        onIndexChanged: (index) => _currentAccountIndex = index,
+      );
     });
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -101,7 +101,7 @@ class _DashboardPageState extends State<DashboardPage>
   @override
   void dispose() {
     _connectionCheckTimer?.cancel();
-    _centersScrollController.dispose();
+    _accountsScrollController.dispose();
     _controller.dispose();
     super.dispose();
   }
@@ -125,9 +125,66 @@ class _DashboardPageState extends State<DashboardPage>
 
   // ... tout le reste du code (fetch, _statCard, _centerCard, etc.) reste IDENTIQUE ...
 
+  void _updateScrollIndex({
+    required ScrollController controller,
+    required int itemCount,
+    required int currentIndex,
+    required ValueChanged<int> onIndexChanged,
+  }) {
+    if (itemCount == 0) return;
+    final index = (controller.offset / 336).round();
+    if (index != currentIndex && index >= 0 && index < itemCount) {
+      setState(() => onIndexChanged(index));
+    }
+  }
+
+  List<dynamic> _filterAccountsData(List<dynamic> accountsData) {
+    final filtered = <dynamic>[];
+
+    for (final account in accountsData) {
+      if (account is! Map) continue;
+      final name = (account['name'] as String?)?.trim() ?? '';
+      if (name.isEmpty) continue;
+      filtered.add(account);
+    }
+
+    return filtered;
+  }
+
+  Future<void> _loadFromCache() async {
+    final authProvider = Provider.of<AuthProvider>(context, listen: false);
+    final cached = await PageCacheService.load(
+      'dashboard',
+      userToken: authProvider.currentToken,
+    );
+    if (cached == null || !mounted) return;
+
+    setState(() {
+      final cachedAdmin = List<dynamic>.from(cached['adminAccounts'] ?? []);
+      final cachedTeacher = List<dynamic>.from(cached['teacherAccounts'] ?? []);
+      accounts = List<dynamic>.from(
+        cached['accounts'] ??
+            (cachedAdmin.isNotEmpty || cachedTeacher.isNotEmpty
+                ? [...cachedAdmin, ...cachedTeacher]
+                : cached['centers'] ?? []),
+      );
+      sessions = List<dynamic>.from(cached['sessions'] ?? []);
+      totalSessions = (cached['totalSessions'] as num?)?.toInt() ?? 0;
+      totalUsers = (cached['totalUsers'] as num?)?.toInt() ?? 0;
+      totalInstructors = (cached['totalInstructors'] as num?)?.toInt() ?? 0;
+      totalAccounts = (cached['totalAccounts'] as num?)?.toInt() ?? 0;
+      totalFormations = (cached['totalFormations'] as num?)?.toInt() ?? 0;
+      _currentAccountIndex = 0;
+      isLoading = false;
+    });
+    if (mounted) {
+      SessionStatusCache.updateUserModel(context, sessions.isNotEmpty);
+    }
+    _controller.forward();
+  }
+
   Future<void> _checkAuthAndFetchData() async {
     final authProvider = Provider.of<AuthProvider>(context, listen: false);
-    final loadingProvider = Provider.of<LoadingProvider>(context, listen: false);
 
     if (!authProvider.isLoggedIn) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -141,14 +198,15 @@ class _DashboardPageState extends State<DashboardPage>
       return;
     }
 
-    loadingProvider.showLoading();
-    await Future.delayed(const Duration(milliseconds: 300));
+    await _loadFromCache();
+    if (mounted && accounts.isEmpty) {
+      setState(() => isLoading = true);
+    }
     await fetchDashboardData();
   }
 
   Future<void> fetchDashboardData() async {
     final authProvider = Provider.of<AuthProvider>(context, listen: false);
-    final loadingProvider = Provider.of<LoadingProvider>(context, listen: false);
     const endpoint = '/index-mobile';
 
     developer.log('Fetching dashboard data...', name: 'DashboardPage');
@@ -162,7 +220,7 @@ class _DashboardPageState extends State<DashboardPage>
         final data = jsonDecode(response.body);
         developer.log('Dashboard data: $data', name: 'DashboardPage');
 
-        final centersData = data['accountsData'] ?? [];
+        final accountsData = _filterAccountsData(data['accountsData'] ?? []);
         final sessionsData = data['sessionData'] ?? [];
         final totalSessionsData = (data['allSession'] as num?)?.toInt() ?? 0;
         final totalUsersData = (data['users'] as num?)?.toInt() ?? 0;
@@ -170,22 +228,41 @@ class _DashboardPageState extends State<DashboardPage>
         final totalAccountsData = (data['allAccounts'] as num?)?.toInt() ?? 0;
         final totalFormationsData = (data['allFormations'] as num?)?.toInt() ?? 0;
 
-        await _preloadImages(centersData);
-
-        await Future.delayed(const Duration(milliseconds: 800));
-
+        // Afficher les données tout de suite, précharger les images en arrière-plan
         setState(() {
-          centers = centersData;
+          accounts = accountsData;
           sessions = sessionsData;
           totalSessions = totalSessionsData;
           totalUsers = totalUsersData;
           totalInstructors = totalInstructorsData;
           totalAccounts = totalAccountsData;
           totalFormations = totalFormationsData;
-          _currentCenterIndex = 0; // reset index
+          _currentAccountIndex = 0;
+          isLoading = false;
         });
 
+        if (mounted) {
+          SessionStatusCache.updateUserModel(context, sessionsData.isNotEmpty);
+        }
+
         _controller.forward();
+        _preloadImages(accountsData).then((_) {
+          if (mounted) setState(() {});
+        });
+
+        await PageCacheService.save(
+          'dashboard',
+          {
+            'accounts': accountsData,
+            'sessions': sessionsData,
+            'totalSessions': totalSessionsData,
+            'totalUsers': totalUsersData,
+            'totalInstructors': totalInstructorsData,
+            'totalAccounts': totalAccountsData,
+            'totalFormations': totalFormationsData,
+          },
+          userToken: authProvider.currentToken,
+        );
       } else {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
@@ -221,7 +298,7 @@ class _DashboardPageState extends State<DashboardPage>
         });
       }
     } finally {
-      loadingProvider.hideLoading();
+      if (mounted) setState(() => isLoading = false);
     }
   }
 
@@ -325,9 +402,15 @@ class _DashboardPageState extends State<DashboardPage>
     );
   }
 
-  Widget _centerCard(Map<String, dynamic> center) {
+  Widget _accountCard(Map<String, dynamic> account, {required bool isTeacher}) {
     final theme = Theme.of(context);
     final isDark = theme.brightness == Brightness.dark;
+    final description = (account['frontEndDescription'] as String?)?.trim();
+    final subtitle = description?.isNotEmpty == true
+        ? description!
+        : (isTeacher
+            ? 'Enseignant indépendant'
+            : 'Centre de formation');
 
     return Container(
       width: 320,
@@ -349,10 +432,30 @@ class _DashboardPageState extends State<DashboardPage>
         mainAxisAlignment: MainAxisAlignment.center,
         crossAxisAlignment: CrossAxisAlignment.center,
         children: [
-          _buildCenterImage(center),
+          _buildCenterImage(account),
           const SizedBox(height: 16),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+            decoration: BoxDecoration(
+              color: isTeacher
+                  ? (isDark ? Colors.orange.withOpacity(0.2) : Colors.orange.shade50)
+                  : (isDark ? Colors.deepPurple.withOpacity(0.2) : Colors.deepPurple.shade50),
+              borderRadius: BorderRadius.circular(20),
+            ),
+            child: Text(
+              isTeacher ? 'Compte enseignant' : 'Compte admin',
+              style: GoogleFonts.poppins(
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+                color: isTeacher
+                    ? (isDark ? Colors.orange.shade300 : Colors.orange.shade800)
+                    : (isDark ? Colors.deepPurple.shade200 : Colors.deepPurple.shade700),
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
           Text(
-            center['name'] ?? 'Unknown Center',
+            account['name'] ?? 'Compte inconnu',
             textAlign: TextAlign.center,
             style: GoogleFonts.poppins(
               fontSize: 19,
@@ -365,7 +468,7 @@ class _DashboardPageState extends State<DashboardPage>
           const SizedBox(height: 8),
           Flexible(
             child: Text(
-              center['frontEndDescription'] ?? 'No description available.',
+              subtitle,
               textAlign: TextAlign.center,
               style: GoogleFonts.poppins(
                 fontSize: 14,
@@ -389,11 +492,16 @@ class _DashboardPageState extends State<DashboardPage>
             ),
             child: ElevatedButton(
               onPressed: () {
-                final centerSessions = sessions.where((session) => session['accountId'] == center['id']).toList();
+                final accountSessions =
+                    sessions.where((session) => session['accountId'] == account['id']).toList();
                 Navigator.push(
                   context,
                   MaterialPageRoute(
-                    builder: (context) => CenterSessionsPage(center: center, sessions: centerSessions),
+                    builder: (context) => CenterSessionsPage(
+                      center: account,
+                      sessions: accountSessions,
+                      isTeacher: isTeacher,
+                    ),
                   ),
                 );
               },
@@ -415,6 +523,113 @@ class _DashboardPageState extends State<DashboardPage>
               ),
             ),
           ),
+        ],
+      ),
+    );
+  }
+
+  Widget _accountsCarouselSection({
+    required String title,
+    required String subtitle,
+    required List<dynamic> accounts,
+    required ScrollController scrollController,
+    required int currentIndex,
+    required String emptyMessage,
+  }) {
+    final theme = Theme.of(context);
+    final isDark = theme.brightness == Brightness.dark;
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          colors: isDark
+              ? [Colors.purple.shade900.withOpacity(0.4), Colors.blue.shade900.withOpacity(0.3)]
+              : [Colors.purple.shade50, Colors.blue.shade50],
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+        ),
+        borderRadius: BorderRadius.circular(24),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(isDark ? 0.4 : 0.1),
+            blurRadius: 20,
+            offset: const Offset(0, 10),
+          ),
+        ],
+      ),
+      child: Column(
+        children: [
+          Text(
+            title,
+            textAlign: TextAlign.center,
+            style: GoogleFonts.poppins(
+              fontSize: 24,
+              fontWeight: FontWeight.w800,
+              color: isDark ? Colors.orange.shade400 : Colors.deepPurple.shade800,
+              height: 1.2,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            subtitle,
+            textAlign: TextAlign.center,
+            style: GoogleFonts.poppins(
+              fontSize: 15,
+              color: isDark ? Colors.white70 : Colors.grey.shade700,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+          const SizedBox(height: 20),
+          SizedBox(
+            height: 480,
+            child: accounts.isEmpty
+                ? Center(
+                    child: Text(
+                      emptyMessage,
+                      style: GoogleFonts.poppins(
+                        fontSize: 16,
+                        color: isDark ? Colors.white70 : Colors.grey,
+                      ),
+                      textAlign: TextAlign.center,
+                    ),
+                  )
+                : ListView.builder(
+                    controller: scrollController,
+                    scrollDirection: Axis.horizontal,
+                    itemCount: accounts.length,
+                    itemBuilder: (context, index) {
+                      final account = accounts[index];
+                      final isTeacher = account['isTeacher'] == true;
+                      return _accountCard(account, isTeacher: isTeacher);
+                    },
+                  ),
+          ),
+          const SizedBox(height: 10),
+          if (accounts.isNotEmpty)
+            FittedBox(
+              fit: BoxFit.scaleDown,
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                mainAxisSize: MainAxisSize.min,
+                children: List.generate(
+                  accounts.length,
+                  (index) => AnimatedContainer(
+                    duration: const Duration(milliseconds: 300),
+                    margin: const EdgeInsets.symmetric(horizontal: 4),
+                    height: 9,
+                    width: index == currentIndex ? 24 : 9,
+                    decoration: BoxDecoration(
+                      color: index == currentIndex
+                          ? (isDark ? Colors.orange.shade400 : Colors.deepPurple)
+                          : Colors.grey.shade400,
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                  ),
+                ),
+              ),
+            ),
         ],
       ),
     );
@@ -477,7 +692,13 @@ class _DashboardPageState extends State<DashboardPage>
     return LoadingWrapper(
       child: Scaffold(
         backgroundColor: theme.scaffoldBackgroundColor,
-        body: isConnectionError
+        body: isLoading
+            ? Center(
+                child: CircularProgressIndicator(
+                  color: isDark ? Colors.deepPurple : theme.primaryColor,
+                ),
+              )
+            : isConnectionError
             ? Center(
                 child: Column(
                   mainAxisAlignment: MainAxisAlignment.center,
@@ -592,7 +813,9 @@ class _DashboardPageState extends State<DashboardPage>
                           const SizedBox(height: 20),
 
                           // CARTE PRINCIPALE "REJOINDRE UNE SESSION"
-                          Container(
+                          KeyedSubtree(
+                            key: TutorialKeys.joinSession,
+                            child: Container(
                             width: double.infinity,
                             margin: const EdgeInsets.symmetric(horizontal: 4),
                             decoration: BoxDecoration(
@@ -681,6 +904,7 @@ class _DashboardPageState extends State<DashboardPage>
                                 ),
                               ),
                             ),
+                          ),
                           ),
 
                           const SizedBox(height: 20),
@@ -771,91 +995,13 @@ class _DashboardPageState extends State<DashboardPage>
                       ),
                     ),
                     const SizedBox(height: 32),
-                    // SECTION DES CENTRES — AVEC INDICATEURS QUI SUIVENT LE SCROLL (EN BAS DE PAGE)
-                    Container(
-                      width: double.infinity,
-                      padding: const EdgeInsets.all(20),
-                      decoration: BoxDecoration(
-                        gradient: LinearGradient(
-                          colors: isDark
-                              ? [Colors.purple.shade900.withOpacity(0.4), Colors.blue.shade900.withOpacity(0.3)]
-                              : [Colors.purple.shade50, Colors.blue.shade50],
-                          begin: Alignment.topLeft,
-                          end: Alignment.bottomRight,
-                        ),
-                        borderRadius: BorderRadius.circular(24),
-                        boxShadow: [
-                          BoxShadow(
-                            color: Colors.black.withOpacity(isDark ? 0.4 : 0.1),
-                            blurRadius: 20,
-                            offset: const Offset(0, 10),
-                          ),
-                        ],
-                      ),
-                      child: Column(
-                        children: [
-                          Text(
-                            'Les meilleurs centres pour réussir sa carrière',
-                            textAlign: TextAlign.center,
-                            style: GoogleFonts.poppins(
-                              fontSize: 24,
-                              fontWeight: FontWeight.w800,
-                              color: isDark ? Colors.orange.shade400 : Colors.deepPurple.shade800,
-                              height: 1.2,
-                            ),
-                          ),
-                          const SizedBox(height: 8),
-                          Text(
-                            'Trouvez les meilleures institutions pour enrichir votre parcours',
-                            textAlign: TextAlign.center,
-                            style: GoogleFonts.poppins(
-                              fontSize: 15,
-                              color: isDark ? Colors.white70 : Colors.grey.shade700,
-                              fontWeight: FontWeight.w500,
-                            ),
-                          ),
-                          const SizedBox(height: 20),
-                          SizedBox(
-                            height: 480,
-                            child: centers.isEmpty
-                                ? const Center(
-                              child: Text(
-                                "Aucun centre disponible pour le moment",
-                                style: TextStyle(fontSize: 16, color: Colors.grey),
-                              ),
-                            )
-                                : ListView.builder(
-                              controller: _centersScrollController, // Controller ajouté
-                              scrollDirection: Axis.horizontal,
-                              itemCount: centers.length,
-                              itemBuilder: (context, index) {
-                                return _centerCard(centers[index]);
-                              },
-                            ),
-                          ),
-                          const SizedBox(height: 10),
-                          // Indicateurs de pagination qui suivent le scroll
-                          if (centers.isNotEmpty)
-                            Row(
-                              mainAxisAlignment: MainAxisAlignment.center,
-                              children: List.generate(
-                                centers.length,
-                                    (index) => AnimatedContainer(
-                                  duration: const Duration(milliseconds: 300),
-                                  margin: const EdgeInsets.symmetric(horizontal: 4),
-                                  height: 9,
-                                  width: index == _currentCenterIndex ? 24 : 9,
-                                  decoration: BoxDecoration(
-                                    color: index == _currentCenterIndex
-                                        ? (isDark ? Colors.orange.shade400 : Colors.deepPurple)
-                                        : Colors.grey.shade400,
-                                    borderRadius: BorderRadius.circular(12),
-                                  ),
-                                ),
-                              ),
-                            ),
-                        ],
-                      ),
+                    _accountsCarouselSection(
+                      title: 'Centres & enseignants',
+                      subtitle: 'Découvrez les comptes admin et les profils enseignants',
+                      accounts: accounts,
+                      scrollController: _accountsScrollController,
+                      currentIndex: _currentAccountIndex,
+                      emptyMessage: 'Aucun compte disponible pour le moment',
                     ),
                     const SizedBox(height: 40),
                   ],
@@ -973,8 +1119,14 @@ class AnimatedCounter extends StatelessWidget {
 class CenterSessionsPage extends StatelessWidget {
   final Map<String, dynamic> center;
   final List<dynamic> sessions;
+  final bool isTeacher;
 
-  const CenterSessionsPage({Key? key, required this.center, required this.sessions}) : super(key: key);
+  const CenterSessionsPage({
+    Key? key,
+    required this.center,
+    required this.sessions,
+    this.isTeacher = false,
+  }) : super(key: key);
 
   @override
   Widget build(BuildContext context) {
@@ -1007,11 +1159,14 @@ class CenterSessionsPage extends StatelessWidget {
                       onPressed: () => Navigator.pop(context),
                     ),
                     const SizedBox(width: 8),
-                    Icon(Icons.school, color: theme.appBarTheme.iconTheme?.color ?? Colors.white),
+                    Icon(
+                      isTeacher ? Icons.person : Icons.school,
+                      color: theme.appBarTheme.iconTheme?.color ?? Colors.white,
+                    ),
                     const SizedBox(width: 8),
                     Expanded(
                       child: Text(
-                        center['name'] ?? 'Centre',
+                        center['name'] ?? (isTeacher ? 'Enseignant' : 'Centre'),
                         style: GoogleFonts.poppins(
                           fontSize: 20,
                           fontWeight: FontWeight.bold,

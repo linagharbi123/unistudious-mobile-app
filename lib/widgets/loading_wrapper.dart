@@ -19,11 +19,15 @@ class LoadingWrapper extends StatelessWidget {
           children: [
             child!,
             if (loadingProvider.isLoading)
-              Container(
-                width: double.infinity,
-                height: double.infinity,
-                color: Colors.black.withOpacity(0.5),
-                child: const LoadingWidget(),
+              Positioned.fill(
+                child: AbsorbPointer(
+                  child: Container(
+                    width: double.infinity,
+                    height: double.infinity,
+                    color: Colors.black.withOpacity(0.5),
+                    child: const LoadingWidget(),
+                  ),
+                ),
               ),
           ],
         );

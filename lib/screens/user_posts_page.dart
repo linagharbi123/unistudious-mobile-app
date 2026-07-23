@@ -1285,7 +1285,16 @@ class _UserPostsPageState extends State<UserPostsPage> {
   }
 
   String _stripHtml(String html) {
-    return html.replaceAll(RegExp(r'<[^>]*>'), '').trim();
+    // Convertir les sauts de ligne HTML en \n avant de supprimer les balises
+    return html
+        .replaceAll(RegExp(r'<br\s*/?>', caseSensitive: false), '\n')
+        .replaceAll(RegExp(r'</p\s*>', caseSensitive: false), '\n')
+        .replaceAll(RegExp(r'</div\s*>', caseSensitive: false), '\n')
+        .replaceAll(RegExp(r'</li\s*>', caseSensitive: false), '\n')
+        .replaceAll(RegExp(r'<[^>]*>'), '')
+        .replaceAll(RegExp(r'[ \t]+\n'), '\n')
+        .replaceAll(RegExp(r'\n{3,}'), '\n\n')
+        .trim();
   }
 
   String _timeAgo(DateTime date) {

@@ -529,7 +529,7 @@ class _ListMeetPageState extends State<ListMeetPage> {
               gradient: LinearGradient(
                 colors: isDark
                     ? const [Color(0xFF1A003D), Color(0xFF3C0D73)]
-                    : const [Color(0xFF8E2DE2), Color(0xFF4A00E0)],
+                  : const [Color(0xFF8E2DE2), Color(0xFF4A00E0)],
                 begin: Alignment.topLeft,
                 end: Alignment.bottomRight,
               ),

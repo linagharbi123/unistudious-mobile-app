@@ -7,6 +7,7 @@ import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'dart:convert';
 import 'dart:io' show Platform;
 import 'package:image_picker_android/image_picker_android.dart';
 import 'package:image_picker_platform_interface/image_picker_platform_interface.dart';
@@ -25,7 +26,6 @@ import 'screens/terms_of_use.dart';
 import 'screens/cookie_policy.dart';
 import 'screens/payment_policy.dart';
 import 'screens/refund_policy.dart';
-import 'screens/course_details_page.dart';
 import 'screens/calendar_page.dart';
 import 'screens/social_feed_page.dart';
 import 'screens/resources_page.dart';
@@ -54,11 +54,12 @@ import 'providers/loading_provider.dart';
 import 'providers/notifications_list_provider.dart';
 import 'widgets/sidebar.dart';
 import 'widgets/loading_wrapper.dart';
+import 'widgets/single_tap_scope.dart';
+import 'utils/main_navigation_helper.dart';
 import 'config/app_config.dart';
 import 'services/version_check_service.dart';
 import 'screens/version_check_page.dart';
 import 'models/version_check_response.dart';
-import 'package:flutter/foundation.dart';
 
 // Instance de flutter_local_notifications pour afficher les notifications sur Android
 final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
@@ -72,6 +73,133 @@ AuthProvider? _globalAuthProvider;
 
 // Clé globale pour le NavigatorState afin de naviguer depuis n'importe où
 final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
+
+// Deep link notification : évite la course avec le démarrage (dashboard) et les doubles navigations
+String? _pendingNotificationRedirect;
+Map<String, dynamic>? _pendingNotificationData;
+bool _initialHomeNavigationDone = false;
+bool _homeBootstrapStarted = false;
+String? _lastHandledNotificationKey;
+DateTime? _lastHandledNotificationAt;
+
+/// Extrait la cible de navigation depuis les data FCM / Intent / userInfo.
+/// Supporte: redirect, direction, location, route, action, click_action.
+/// Fallback: FLUTTER_NOTIFICATION_CLICK / titre "message" → messagerie.
+String? _extractRedirectFromData(
+  Map<String, dynamic>? data, {
+  String? title,
+  String? body,
+}) {
+  if (data != null && data.isNotEmpty) {
+    final raw = data['redirect'] ??
+        data['direction'] ??
+        data['location'] ??
+        data['route'] ??
+        data['action'];
+    if (raw != null) {
+      final value = raw.toString().trim();
+      if (value.isNotEmpty) {
+        if (value.toLowerCase() == 'flutter_notification_click') {
+          return 'messagerie';
+        }
+        return value;
+      }
+    }
+
+    // Souvent le serveur n'envoie que click_action=FLUTTER_NOTIFICATION_CLICK
+    final clickAction = data['click_action']?.toString().trim();
+    if (clickAction != null && clickAction.isNotEmpty) {
+      if (clickAction.toLowerCase() == 'flutter_notification_click') {
+        return 'messagerie';
+      }
+      // click_action métier (ex: "chat", "messagerie")
+      if (clickAction.toLowerCase() != 'flutter_notification_click') {
+        return clickAction;
+      }
+    }
+  }
+
+  // Heuristique messages sans redirect explicite
+  final titleLower = (title ?? data?['title'] ?? '').toString().toLowerCase();
+  final bodyLower = (body ?? data?['body'] ?? data?['message'] ?? '').toString().toLowerCase();
+  if (titleLower.contains('message') ||
+      titleLower.contains('msg') ||
+      titleLower.contains('chat') ||
+      bodyLower.contains('message')) {
+    return 'messagerie';
+  }
+
+  return null;
+}
+
+String _notificationDedupeKey(String redirect, Map<String, dynamic>? data) {
+  final roomId = data?['room_id']?.toString() ?? data?['roomId']?.toString() ?? '';
+  return '$redirect|$roomId';
+}
+
+/// Met en file ou navigue vers la page de la notification.
+void _queueOrNavigateFromNotification(
+  String? redirectPath, [
+  Map<String, dynamic>? data,
+]) {
+  if (redirectPath == null || redirectPath.isEmpty) return;
+
+  final key = _notificationDedupeKey(redirectPath, data);
+  final now = DateTime.now();
+  if (_lastHandledNotificationKey == key &&
+      _lastHandledNotificationAt != null &&
+      now.difference(_lastHandledNotificationAt!) < const Duration(seconds: 2)) {
+    if (kDebugMode) {
+      print('ℹ️ Navigation notification ignorée (doublon): $redirectPath');
+    }
+    return;
+  }
+
+  // Cold start / navigator pas prêt → garder pour après le home
+  if (!_initialHomeNavigationDone || navigatorKey.currentState == null) {
+    _pendingNotificationRedirect = redirectPath;
+    _pendingNotificationData = data;
+    if (kDebugMode) {
+      print('⏳ Redirect notification en attente: $redirectPath');
+    }
+    return;
+  }
+
+  _lastHandledNotificationKey = key;
+  _lastHandledNotificationAt = now;
+  _navigateToRoute(redirectPath, data);
+}
+
+/// Applique le redirect en attente après le démarrage (si utilisateur connecté).
+void _flushPendingNotificationNavigation({bool userLoggedIn = true}) {
+  final redirect = _pendingNotificationRedirect;
+  if (redirect == null || redirect.isEmpty) return;
+
+  if (!userLoggedIn) {
+    if (kDebugMode) {
+      print('⚠️ Redirect notification conservé (utilisateur non connecté): $redirect');
+    }
+    return;
+  }
+
+  final data = _pendingNotificationData;
+  _pendingNotificationRedirect = null;
+  _pendingNotificationData = null;
+
+  final key = _notificationDedupeKey(redirect, data);
+  _lastHandledNotificationKey = key;
+  _lastHandledNotificationAt = DateTime.now();
+
+  if (kDebugMode) {
+    print('🚀 Flush redirect notification: $redirect');
+  }
+
+  WidgetsBinding.instance.addPostFrameCallback((_) {
+    Future.delayed(const Duration(milliseconds: 350), () {
+      _navigateToRoute(redirect, data);
+    });
+  });
+}
 
 // Fonction pour mapper les valeurs de redirect vers les vraies routes de l'application
 String _mapRedirectToRoute(String redirectPath) {
@@ -95,14 +223,8 @@ String _mapRedirectToRoute(String redirectPath) {
     'home': '/dashboard',
     'accueil': '/dashboard',
 
-    // Cours / cours en ligne
-    'cours': '/mes-cours',
-    'mes-cours': '/mes-cours',
-    'course': '/mes-cours',
-    'courses': '/mes-cours',
-    'online course': '/mes-cours',
-    'cours en ligne': '/mes-cours',
-    'meet': '/mes-cours',               // ton choix: meet -> cours en ligne
+    // Meet / réunions
+    'meet': '/list-meet',
 
     // Social / fil social
     'social': '/fil-social',
@@ -155,8 +277,12 @@ String _mapRedirectToRoute(String redirectPath) {
     'join session': '/join-session',
     'rejoindre une session': '/join-session',
     
+    // Paramètres notifications push
+    'push_notifications': '/push_notifications',
+    'notifications': '/push_notifications',
+    'notification settings': '/push_notifications',
+
     // Cas spéciaux techniques (valeurs par défaut de Firebase pour Flutter)
-    // On les redirige vers la messagerie pour les notifications de message
     'flutter_notification_click': '/messagerie',
   };
   
@@ -172,7 +298,8 @@ String _mapRedirectToRoute(String redirectPath) {
 }
 
 // Fonction pour naviguer vers une route spécifique basée sur le paramètre redirect
-void _navigateToRoute(String? redirectPath) {
+// [data] : données complètes de la notification (pour routes avec arguments, ex: room_id pour /chat)
+void _navigateToRoute(String? redirectPath, [Map<String, dynamic>? data]) {
   if (redirectPath == null || redirectPath.isEmpty) {
     if (kDebugMode) {
       print('⚠️ Aucun chemin de redirection fourni');
@@ -186,6 +313,9 @@ void _navigateToRoute(String? redirectPath) {
   if (kDebugMode) {
     print('📍 Redirect original: $redirectPath');
     print('📍 Route mappée: $route');
+    if (data != null && data.isNotEmpty) {
+      print('📍 Données: $data');
+    }
   }
 
   final navigator = navigatorKey.currentState;
@@ -195,29 +325,34 @@ void _navigateToRoute(String? redirectPath) {
     }
     // Attendre que le Navigator soit disponible
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      _navigateToRoute(redirectPath);
+      _navigateToRoute(redirectPath, data);
     });
     return;
   }
 
   try {
     // Vérifier si la route est une route de la bottom bar
-    if (route == '/dashboard' || route == '/mes-cours' || route == '/fil-social' ||
+    if (route == '/dashboard' || route == '/groups' || route == '/fil-social' ||
         route == '/ressources' || route == '/profile') {
-      final context = navigator.context;
-      final provider = Provider.of<BottomNavigationProvider>(context, listen: false);
-      const routeToIndexMap = {
-        '/dashboard': 0,
-        '/mes-cours': 1,
-        '/fil-social': 2,
-        '/ressources': 3,
-        '/profile': 4,
-      };
-      provider.updateIndex(routeToIndexMap[route] ?? 0);
-      navigator.pushNamedAndRemoveUntil(
-        route,
-        (route) => false,
-      );
+      final index = MainNavigationHelper.indexForRoute(route) ?? 0;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (navigator.context.mounted) {
+          MainNavigationHelper.navigateToTab(navigator.context, index);
+        }
+      });
+    } else if (route == '/chat' && data != null) {
+      // Chat nécessite room_id pour ouvrir une conversation spécifique
+      final roomId = data['room_id']?.toString() ?? data['roomId']?.toString();
+      if (roomId != null && roomId.isNotEmpty) {
+        final args = <String, dynamic>{
+          'room_id': roomId,
+          'name': data['name']?.toString() ?? data['sender_name']?.toString() ?? 'Conversation',
+          'avatar_url': data['avatar_url']?.toString() ?? data['avatar']?.toString(),
+        };
+        navigator.pushNamedAndRemoveUntil('/chat', (r) => false, arguments: args);
+      } else {
+        navigator.pushNamedAndRemoveUntil('/messagerie', (r) => false);
+      }
     } else {
       // Pour les autres routes, navigation normale
       navigator.pushNamedAndRemoveUntil(
@@ -250,8 +385,9 @@ Future<void> _initializeLocalNotifications() async {
     initializationSettings,
     onDidReceiveNotificationResponse: (NotificationResponse response) {
       if (kDebugMode) {
-        print('📱 Notification cliquée: ${response.payload}');
+        print('📱 Notification locale cliquée: ${response.payload}');
       }
+      _handleLocalNotificationPayload(response.payload);
     },
   );
 
@@ -270,6 +406,33 @@ Future<void> _initializeLocalNotifications() async {
 
   if (kDebugMode) {
     print('✅ flutter_local_notifications initialisé pour Android');
+  }
+}
+
+void _handleLocalNotificationPayload(String? payload) {
+  if (payload == null || payload.isEmpty) return;
+  try {
+    final decoded = jsonDecode(payload);
+    if (decoded is! Map) return;
+    final data = Map<String, dynamic>.from(
+      decoded.map((key, value) => MapEntry(key.toString(), value)),
+    );
+    final redirect = _extractRedirectFromData(
+      data,
+      title: data['title']?.toString(),
+      body: data['body']?.toString(),
+    );
+    if (kDebugMode) {
+      print('📱 Payload notif locale décodé: $data');
+      print('📍 Redirect résolu: $redirect');
+    }
+    if (redirect != null) {
+      _queueOrNavigateFromNotification(redirect, data);
+    }
+  } catch (e) {
+    if (kDebugMode) {
+      print('❌ Payload notification locale invalide: $e');
+    }
   }
 }
 
@@ -307,8 +470,12 @@ Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
   }
 }
 
-// Afficher une notification locale sur Android
-Future<void> _showLocalNotification(String title, String body) async {
+// Afficher une notification locale sur Android (avec payload pour deep link au clic)
+Future<void> _showLocalNotification(
+  String title,
+  String body, [
+  Map<String, dynamic>? data,
+]) async {
   if (!Platform.isAndroid) return;
 
   try {
@@ -325,17 +492,35 @@ Future<void> _showLocalNotification(String title, String body) async {
     const NotificationDetails platformChannelSpecifics =
         NotificationDetails(android: androidPlatformChannelSpecifics);
 
+    final payloadData = <String, dynamic>{
+      if (data != null) ...data,
+      'title': title,
+      'body': body,
+    };
+    // Garantir un redirect utilisable au clic (même si le serveur n'envoie que click_action)
+    final redirect = _extractRedirectFromData(
+      payloadData,
+      title: title,
+      body: body,
+    );
+    if (redirect != null) {
+      payloadData['redirect'] = redirect;
+    }
+
     await flutterLocalNotificationsPlugin.show(
       DateTime.now().millisecondsSinceEpoch.remainder(100000),
       title,
       body,
       platformChannelSpecifics,
+      payload: jsonEncode(payloadData),
     );
 
     if (kDebugMode) {
       print('✅ Notification locale affichée sur Android');
       print('   Title: $title');
       print('   Body: $body');
+      print('   Data keys: ${data?.keys.toList()}');
+      print('   Payload redirect: $redirect');
     }
   } catch (e) {
     if (kDebugMode) {
@@ -377,12 +562,37 @@ void _setupFirebaseMessaging() {
   // Handler pour les messages en foreground
   FirebaseMessaging.onMessage.listen((RemoteMessage message) {
     // Recharger les notifications IMMÉDIATEMENT lorsqu'une notification arrive
-    // Appeler plusieurs fois pour s'assurer que ça fonctionne
     _reloadNotifications();
-    // Attendre un court délai et recharger à nouveau pour être sûr
     Future.delayed(const Duration(milliseconds: 500), () {
       _reloadNotifications();
     });
+
+    // Android foreground: afficher une notif locale AVEC payload (deep link au clic)
+    if (Platform.isAndroid) {
+      if (message.notification != null) {
+        _showLocalNotification(
+          message.notification!.title ?? 'Notification',
+          message.notification!.body ?? '',
+          Map<String, dynamic>.from(message.data),
+        );
+      } else if (message.data.isNotEmpty) {
+        final title = message.data['title'] ??
+            message.data['notification.title'] ??
+            message.data['notification_title'] ??
+            'Notification';
+        final body = message.data['body'] ??
+            message.data['message'] ??
+            message.data['notification.body'] ??
+            message.data['notification_body'] ??
+            message.data['text'] ??
+            'Nouvelle notification';
+        _showLocalNotification(
+          title.toString(),
+          body.toString(),
+          Map<String, dynamic>.from(message.data),
+        );
+      }
+    }
     
     if (kDebugMode) {
       final platform = Platform.isIOS ? '🍎 iOS' : (Platform.isAndroid ? '🤖 Android' : '❓ Unknown');
@@ -393,84 +603,22 @@ void _setupFirebaseMessaging() {
       print('Message ID: ${message.messageId}');
       print('From: ${message.from}');
       print('Sent Time: ${message.sentTime}');
-      print('Message Type: ${message.messageType}');
-      print('Collapse Key: ${message.collapseKey}');
-      print('Ttl: ${message.ttl}');
-      print('');
       print('--- NOTIFICATION ---');
       if (message.notification != null) {
-        print('  ✅ Notification présente');
         print('  Title: ${message.notification?.title}');
         print('  Body: ${message.notification?.body}');
-        if (Platform.isIOS) {
-          print('  🍎 iOS: La notification sera affichée par iOS');
-        } else if (Platform.isAndroid) {
-          print('  🤖 Android: La notification sera affichée par le service Android');
-        }
       } else {
         print('  ⚠️ Aucune notification dans le message');
       }
-      print('');
       print('--- DATA ---');
       if (message.data.isNotEmpty) {
-        print('  ✅ Données présentes: ${message.data.length} élément(s)');
         message.data.forEach((key, value) {
           print('  $key: $value');
         });
       } else {
         print('  ⚠️ Aucune donnée dans le message');
       }
-      print('');
-      print('--- DIAGNOSTIC ---');
-      print('  Plateforme: $platform');
-      print('  Notification null: ${message.notification == null}');
-      print('  Data empty: ${message.data.isEmpty}');
-      print('  Message complet: ${message.toString()}');
-      
-      if (message.notification == null && message.data.isEmpty) {
-        print('');
-        print('⚠️ PROBLÈME DÉTECTÉ: Message reçu mais vide!');
-        print('   Cela signifie que le message depuis le web est mal formaté.');
-        print('   Le message doit contenir soit:');
-        print('   - Un champ "notification" avec "title" et "body"');
-        print('   - Ou un champ "data" avec au moins "title" et "body"');
-        print('');
-        print('⚠️ Sur Android, le service natif devrait être appelé mais ne l\'est pas.');
-        print('   Cela indique que Flutter intercepte le message avant le service natif.');
-      } else if (message.notification != null) {
-        print('');
-        print('✅ Message valide avec notification');
-        if (Platform.isIOS) {
-          print('   Sur iOS, la notification sera affichée automatiquement');
-        } else if (Platform.isAndroid) {
-          print('   🤖 Android: Affichage manuel de la notification avec flutter_local_notifications');
-          // Afficher la notification manuellement sur Android
-          _showLocalNotification(
-            message.notification!.title ?? 'Notification',
-            message.notification!.body ?? '',
-          );
-        }
-      } else if (message.data.isNotEmpty) {
-        print('');
-        print('✅ Message data-only détecté');
-        print('   Le service Android/iOS devrait créer une notification');
-        // Essayer d'extraire title et body des données
-        if (Platform.isAndroid) {
-          final title = message.data['title'] ?? 
-                       message.data['notification.title'] ?? 
-                       message.data['notification_title'] ?? 
-                       'Notification';
-          final body = message.data['body'] ?? 
-                      message.data['message'] ?? 
-                      message.data['notification.body'] ?? 
-                      message.data['notification_body'] ?? 
-                      message.data['text'] ?? 
-                      'Nouvelle notification';
-          _showLocalNotification(title, body);
-        }
-      }
       print('═══════════════════════════════════════════════════════');
-      print('');
     }
   });
   
@@ -479,7 +627,6 @@ void _setupFirebaseMessaging() {
   
   // Handler pour les notifications ouvertes (quand l'utilisateur clique dessus)
   FirebaseMessaging.onMessageOpenedApp.listen((RemoteMessage message) {
-    // Recharger immédiatement les notifications quand l'utilisateur ouvre une notification
     _reloadNotifications();
     if (kDebugMode) {
       final platform = Platform.isIOS ? '🍎 iOS' : (Platform.isAndroid ? '🤖 Android' : '❓ Unknown');
@@ -489,90 +636,46 @@ void _setupFirebaseMessaging() {
       print('═══════════════════════════════════════════════════════');
       print('Message ID: ${message.messageId}');
       print('From: ${message.from}');
-      print('--- NOTIFICATION ---');
-      print('  Title: ${message.notification?.title}');
-      print('  Body: ${message.notification?.body}');
       print('--- DATA ---');
       if (message.data.isNotEmpty) {
         message.data.forEach((key, value) {
           print('  $key: $value');
         });
-      } else {
-        print('  Aucune donnée');
       }
       print('═══════════════════════════════════════════════════════');
     }
     
-    // Extraire le paramètre redirect/location et naviguer vers la page spécifique
-    // Vérifier d'abord dans les données, puis dans l'action (pour iOS)
-    final redirectPath = message.data['redirect'] 
-        ?? message.data['location'] 
-        ?? message.data['route']
-        ?? message.data['action'];  // Certains services utilisent 'action' au lieu de 'click_action'
+    final notifData = Map<String, dynamic>.from(message.data);
+    final redirectPath = _extractRedirectFromData(
+      notifData,
+      title: message.notification?.title,
+      body: message.notification?.body,
+    );
     if (redirectPath != null) {
       if (kDebugMode) {
-        print('📍 Paramètre redirect trouvé dans les données: $redirectPath');
+        print('📍 Paramètre redirect trouvé: $redirectPath');
       }
-      _navigateToRoute(redirectPath);
-    } else {
-      if (kDebugMode) {
-        print('⚠️ Aucun paramètre redirect/location trouvé dans les données');
-        print('   Note: Sur Android, le clickAction est géré via le canal de méthode native');
-      }
+      _queueOrNavigateFromNotification(redirectPath, notifData);
+    } else if (kDebugMode) {
+      print('⚠️ Aucun paramètre redirect/direction/location trouvé');
+      print('   Data: ${message.data}');
     }
   });
   
-  // Vérifier si l'app a été ouverte depuis une notification
-  messaging.getInitialMessage().then((RemoteMessage? message) {
-    // Recharger les notifications si l'app a été ouverte depuis une notification
-    if (message != null) {
-      _reloadNotifications();
-      if (kDebugMode) {
-        final platform = Platform.isIOS ? '🍎 iOS' : (Platform.isAndroid ? '🤖 Android' : '❓ Unknown');
-        print('═══════════════════════════════════════════════════════');
-        print('📱 APP OUVERTE DEPUIS UNE NOTIFICATION');
-        print('   Plateforme: $platform');
-        print('═══════════════════════════════════════════════════════');
-        print('Message ID: ${message.messageId}');
-        print('From: ${message.from}');
-      print('--- NOTIFICATION ---');
-      print('  Title: ${message.notification?.title}');
-      print('  Body: ${message.notification?.body}');
-      print('--- DATA ---');
-      if (message.data.isNotEmpty) {
-        message.data.forEach((key, value) {
-          print('  $key: $value');
-        });
-      } else {
-        print('  Aucune donnée');
-      }
-      print('═══════════════════════════════════════════════════════');
-      }
-      
-      // Extraire le paramètre redirect/location et naviguer vers la page spécifique
-      // Vérifier d'abord dans les données, puis dans l'action
-      final redirectPath = message.data['redirect'] 
-          ?? message.data['location'] 
-          ?? message.data['route']
-          ?? message.data['action'];  // Certains services utilisent 'action'
-      if (redirectPath != null) {
-        if (kDebugMode) {
-          print('📍 Paramètre redirect trouvé dans les données: $redirectPath');
-        }
-        // Attendre que l'app soit complètement initialisée avant de naviguer
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          Future.delayed(const Duration(milliseconds: 500), () {
-            _navigateToRoute(redirectPath);
-          });
-        });
-      } else {
-        if (kDebugMode) {
-          print('⚠️ Aucun paramètre redirect/location trouvé dans les données');
-          print('   Note: Sur Android, le clickAction est géré via le canal de méthode native');
-        }
-      }
-    }
-  });
+  // Vérifier si l'app a été ouverte depuis une notification (cold start)
+  // IMPORTANT: ne pas appeler immédiatement — l'Activity Android n'est pas encore
+  // attachée avant runApp → getInitialMessage() renvoie null et la messagerie ne s'ouvre pas.
+  void scheduleInitialMessageCheck() {
+    Future<void> consume() => _consumeInitialFcmMessage();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      consume();
+      Future.delayed(const Duration(milliseconds: 500), consume);
+      Future.delayed(const Duration(milliseconds: 1500), consume);
+      Future.delayed(const Duration(milliseconds: 3000), consume);
+    });
+  }
+
+  scheduleInitialMessageCheck();
   
   if (kDebugMode) {
     print('✅ Handlers Firebase Messaging configurés');
@@ -580,6 +683,60 @@ void _setupFirebaseMessaging() {
   
   // Configurer le canal de méthode pour recevoir les notifications depuis les plateformes natives
   _setupNotificationChannel();
+}
+
+bool _initialFcmMessageConsumed = false;
+
+/// Lit getInitialMessage() une fois l'Activity prête (cold start Android/iOS).
+Future<void> _consumeInitialFcmMessage() async {
+  if (_initialFcmMessageConsumed) return;
+  try {
+    final message = await FirebaseMessaging.instance.getInitialMessage();
+    if (message == null) {
+      if (kDebugMode) {
+        print('ℹ️ getInitialMessage: null (pas encore / déjà consommé)');
+      }
+      return;
+    }
+    _initialFcmMessageConsumed = true;
+    _reloadNotifications();
+    if (kDebugMode) {
+      final platform = Platform.isIOS ? '🍎 iOS' : (Platform.isAndroid ? '🤖 Android' : '❓ Unknown');
+      print('═══════════════════════════════════════════════════════');
+      print('📱 APP OUVERTE DEPUIS UNE NOTIFICATION (getInitialMessage)');
+      print('   Plateforme: $platform');
+      print('═══════════════════════════════════════════════════════');
+      print('Message ID: ${message.messageId}');
+      print('Title: ${message.notification?.title}');
+      print('Body: ${message.notification?.body}');
+      print('--- DATA ---');
+      message.data.forEach((key, value) {
+        print('  $key: $value');
+      });
+      print('═══════════════════════════════════════════════════════');
+    }
+
+    final notifData = Map<String, dynamic>.from(message.data);
+    final redirectPath = _extractRedirectFromData(
+      notifData,
+      title: message.notification?.title,
+      body: message.notification?.body,
+    );
+    if (redirectPath != null) {
+      if (kDebugMode) {
+        print('📍 Redirect cold start (getInitialMessage): $redirectPath');
+      }
+      _queueOrNavigateFromNotification(redirectPath, notifData);
+    } else if (kDebugMode) {
+      print('⚠️ getInitialMessage sans redirect exploitable');
+      print('   Title: ${message.notification?.title}');
+      print('   Data: ${message.data}');
+    }
+  } catch (e) {
+    if (kDebugMode) {
+      print('⚠️ Erreur getInitialMessage: $e');
+    }
+  }
 }
 
 // Configurer le canal de méthode pour recevoir les notifications depuis Android/iOS
@@ -590,22 +747,86 @@ void _setupNotificationChannel() {
     if (call.method == 'onNotificationOpened') {
       final Map<dynamic, dynamic>? arguments = call.arguments as Map<dynamic, dynamic>?;
       if (arguments != null) {
-        final redirectPath = arguments['redirect'] as String?;
+        final data = arguments['data'] as Map<dynamic, dynamic>?;
+        final notifData = <String, dynamic>{};
+        if (data != null) {
+          for (final entry in data.entries) {
+            notifData[entry.key.toString()] = entry.value;
+          }
+        }
+        // redirect peut être au top-level ou dans data
+        final topRedirect = arguments['redirect']?.toString();
+        if (topRedirect != null && topRedirect.isNotEmpty) {
+          notifData.putIfAbsent('redirect', () => topRedirect);
+        }
+        final redirectPath = _extractRedirectFromData(
+              notifData,
+              title: notifData['title']?.toString(),
+              body: notifData['body']?.toString(),
+            ) ??
+            (topRedirect != null && topRedirect.trim().isNotEmpty ? topRedirect.trim() : null);
         if (kDebugMode) {
           print('📱 Notification ouverte depuis plateforme native');
           print('📍 Paramètre redirect reçu: $redirectPath');
+          if (notifData.isNotEmpty) print('📍 Données: $notifData');
         }
         if (redirectPath != null) {
-          // Attendre que l'app soit complètement initialisée
-          WidgetsBinding.instance.addPostFrameCallback((_) {
-            Future.delayed(const Duration(milliseconds: 500), () {
-              _navigateToRoute(redirectPath);
-            });
-          });
+          _queueOrNavigateFromNotification(redirectPath, notifData.isEmpty ? null : notifData);
+          // Confirmer la consommation côté Android (évite re-livraison)
+          try {
+            await channel.invokeMethod('clearPendingNotification');
+          } catch (_) {}
         }
       }
     }
   });
+
+  // Cold start Android : récupérer le redirect Intent si le push natif est arrivé trop tôt
+  Future<void> pullNativePendingNotification() async {
+    if (!Platform.isAndroid) return;
+    try {
+      final result = await channel.invokeMethod<dynamic>('getPendingNotification');
+      if (result is Map) {
+        final args = Map<String, dynamic>.from(
+          result.map((k, v) => MapEntry(k.toString(), v)),
+        );
+        final dataRaw = args['data'];
+        final notifData = <String, dynamic>{};
+        if (dataRaw is Map) {
+          dataRaw.forEach((k, v) => notifData[k.toString()] = v);
+        }
+        final topRedirect = args['redirect']?.toString();
+        if (topRedirect != null && topRedirect.isNotEmpty) {
+          notifData.putIfAbsent('redirect', () => topRedirect);
+        }
+        final redirectPath = _extractRedirectFromData(
+              notifData,
+              title: notifData['title']?.toString(),
+              body: notifData['body']?.toString(),
+            ) ??
+            topRedirect;
+        if (kDebugMode) {
+          print('📥 Pending notification Android récupéré: $redirectPath');
+        }
+        if (redirectPath != null && redirectPath.isNotEmpty) {
+          _queueOrNavigateFromNotification(redirectPath, notifData.isEmpty ? null : notifData);
+          try {
+            await channel.invokeMethod('clearPendingNotification');
+          } catch (_) {}
+        }
+      }
+    } catch (e) {
+      if (kDebugMode) {
+        print('⚠️ getPendingNotification: $e');
+      }
+    }
+  }
+
+  // Pull immédiat + retries (engine / home pas encore prêts)
+  pullNativePendingNotification();
+  Future.delayed(const Duration(milliseconds: 800), pullNativePendingNotification);
+  Future.delayed(const Duration(milliseconds: 2000), pullNativePendingNotification);
+  Future.delayed(const Duration(milliseconds: 4000), pullNativePendingNotification);
   
   if (kDebugMode) {
     print('✅ Canal de méthode pour notifications configuré');
@@ -641,14 +862,17 @@ void main() async {
     }
   }
 
-  // Initialiser AppConfig pour récupérer la plateforme et la version
-  await AppConfig.initialize();
-
+  // Initialiser AppConfig et le thème en parallèle
   final themeProvider = ThemeProvider();
-  await themeProvider.loadTheme();
+  await Future.wait([
+    AppConfig.initialize(),
+    themeProvider.loadTheme(),
+  ]);
 
   final authProvider = AuthProvider();
   _globalAuthProvider = authProvider;
+  // Pré-initialiser l'auth avant runApp pour afficher l'écran plus vite
+  await authProvider.initialize();
   
   runApp(
     MultiProvider(
@@ -674,21 +898,21 @@ class NavigationWrapper extends StatelessWidget {
 
   static const List<String> _titles = [
     'Accueil',
-    'Cours',
+    'Groupe',
     'Social',
     'Ressources',
     'Profil',
   ];
   static const List<IconData> _icons = [
     Icons.home,
-    Icons.book,
+    Icons.groups,
     Icons.people,
     Icons.library_books,
     Icons.person,
   ];
   static const List<String> _routes = [
     '/dashboard',
-    '/mes-cours',
+    '/groups',
     '/fil-social',
     '/ressources',
     '/profile',
@@ -697,7 +921,7 @@ class NavigationWrapper extends StatelessWidget {
   // Map sidebar routes to bottom navigation indices
   static const Map<String, int> _routeToIndexMap = {
     '/dashboard': 0,
-    '/mes-cours': 1,
+    '/groups': 1,
     '/fil-social': 2,
     '/ressources': 3,
     '/profile': 4,
@@ -746,11 +970,7 @@ class NavigationWrapper extends StatelessWidget {
             if (isBottomNavPage) {
               WidgetsBinding.instance.addPostFrameCallback((_) {
                 if (context.mounted) {
-                  provider.updateIndex(index);
-                  Navigator.pushReplacement(
-                    context,
-                    MaterialPageRoute(builder: (_) => const MainNavigationPage()),
-                  );
+                  MainNavigationHelper.navigateToTab(context, index);
                 }
               });
               return LoadingWrapper(child: child!);
@@ -775,7 +995,7 @@ class MyApp extends StatelessWidget {
 
   Future<String> _getInitialRoute(BuildContext context) async {
     final authProvider = Provider.of<AuthProvider>(context, listen: false);
-    await authProvider.initialize();
+    // Auth déjà initialisé dans main() — pas de nouvelle attente réseau
     return authProvider.isLoggedIn ? '/dashboard' : '/login';
   }
 
@@ -993,14 +1213,21 @@ class MyApp extends StatelessWidget {
             final mq = MediaQuery.of(context);
             final clamped = mq.copyWith(textScaler: const TextScaler.linear(1.0));
             final wrappedChild = MediaQuery(data: clamped, child: child!);
-            return ResponsiveBreakpoints.builder(
-              child: BouncingScrollWrapper.builder(context, wrappedChild),
-              breakpoints: const [
-                Breakpoint(start: 0, end: 389, name: MOBILE),
-                Breakpoint(start: 390, end: 599, name: 'MOBILE_L'),
-                Breakpoint(start: 600, end: 899, name: TABLET),
-                Breakpoint(start: 900, end: double.infinity, name: DESKTOP),
-              ],
+            return Consumer<LoadingProvider>(
+              builder: (context, loadingProvider, _) {
+                return SingleTapScope(
+                  externalLock: loadingProvider.isLoading,
+                  child: ResponsiveBreakpoints.builder(
+                    child: BouncingScrollWrapper.builder(context, wrappedChild),
+                    breakpoints: const [
+                      Breakpoint(start: 0, end: 389, name: MOBILE),
+                      Breakpoint(start: 390, end: 599, name: 'MOBILE_L'),
+                      Breakpoint(start: 600, end: 899, name: TABLET),
+                      Breakpoint(start: 900, end: double.infinity, name: DESKTOP),
+                    ],
+                  ),
+                );
+              },
             );
           },
           home: LoadingWrapper(
@@ -1008,51 +1235,94 @@ class MyApp extends StatelessWidget {
               future: _getInitialRoute(context),
               builder: (context, snapshot) {
                 if (snapshot.connectionState == ConnectionState.done) {
-                  // Vérifier la version avant de naviguer
-                  WidgetsBinding.instance.addPostFrameCallback((_) async {
-                    if (!context.mounted) return;
+                  // Une seule fois : éviter que FutureBuilder écrase le deep link notification
+                  if (!_homeBootstrapStarted) {
+                    _homeBootstrapStarted = true;
+                    WidgetsBinding.instance.addPostFrameCallback((_) {
+                      if (!context.mounted) return;
 
-                    final update = await _checkVersionAndGetUpdate();
-                    if (update != null && context.mounted) {
-                      if (kDebugMode) {
-                        print('🚀 Affichage de la page de vérification de version');
-                      }
-                      // Afficher la page de vérification de version
-                      Navigator.of(context).pushReplacement(
-                        MaterialPageRoute(
-                          builder: (context) => VersionCheckPage(update: update),
-                        ),
-                      );
-                      return;
-                    }
-
-                    // Continuer vers la route normale si pas de mise à jour
-                    if (context.mounted) {
-                      if (kDebugMode) {
-                        print('➡️ Navigation vers la route normale: ${snapshot.data ?? '/welcome'}');
-                      }
                       final route = snapshot.data ?? '/welcome';
-                      // Si c'est une route de la bottom bar, utiliser MainNavigationPage
-                      if (route == '/dashboard' || route == '/mes-cours' || route == '/fil-social' ||
-                          route == '/ressources' || route == '/profile') {
-                        final provider = Provider.of<BottomNavigationProvider>(context, listen: false);
-                        const routeToIndexMap = {
-                          '/dashboard': 0,
-                          '/mes-cours': 1,
-                          '/fil-social': 2,
-                          '/ressources': 3,
-                          '/profile': 4,
-                        };
-                        provider.updateIndex(routeToIndexMap[route] ?? 0);
-                        Navigator.pushReplacement(
-                          context,
-                          MaterialPageRoute(builder: (_) => const MainNavigationPage()),
-                        );
-                      } else {
-                        Navigator.pushReplacementNamed(context, route);
+                      final loggedIn = route == '/dashboard';
+                      void navigateToRoute() {
+                        if (!context.mounted) return;
+                        if (route == '/dashboard' || route == '/groups' || route == '/fil-social' ||
+                            route == '/ressources' || route == '/profile') {
+                          final index = MainNavigationHelper.indexForRoute(route) ?? 0;
+                          MainNavigationHelper.navigateToTab(context, index);
+                        } else {
+                          Navigator.pushReplacementNamed(context, route);
+                        }
                       }
-                    }
-                  });
+
+                      navigateToRoute();
+                      _initialHomeNavigationDone = true;
+                      // Après le shell (dashboard/login), ouvrir la page de la notification
+                      _flushPendingNotificationNavigation(userLoggedIn: loggedIn);
+                      // Cold start: getInitialMessage + pending Android Intent (Activity maintenant prête)
+                      if (loggedIn) {
+                        Future.delayed(const Duration(milliseconds: 400), () async {
+                          await _consumeInitialFcmMessage();
+                          _flushPendingNotificationNavigation(userLoggedIn: true);
+                        });
+                        Future.delayed(const Duration(milliseconds: 1200), () async {
+                          await _consumeInitialFcmMessage();
+                          _flushPendingNotificationNavigation(userLoggedIn: true);
+                        });
+                      }
+                      if (loggedIn && Platform.isAndroid) {
+                        Future.delayed(const Duration(milliseconds: 600), () async {
+                          try {
+                            const channel = MethodChannel('com.unistudious.projet1v2/notification');
+                            final result = await channel.invokeMethod<dynamic>('getPendingNotification');
+                            if (result is Map) {
+                              final args = Map<String, dynamic>.from(
+                                result.map((k, v) => MapEntry(k.toString(), v)),
+                              );
+                              final dataRaw = args['data'];
+                              final notifData = <String, dynamic>{};
+                              if (dataRaw is Map) {
+                                dataRaw.forEach((k, v) => notifData[k.toString()] = v);
+                              }
+                              final topRedirect = args['redirect']?.toString();
+                              if (topRedirect != null && topRedirect.isNotEmpty) {
+                                notifData.putIfAbsent('redirect', () => topRedirect);
+                              }
+                              final redirectPath = _extractRedirectFromData(
+                                    notifData,
+                                    title: notifData['title']?.toString() ??
+                                        notifData['gcm.notification.title']?.toString(),
+                                    body: notifData['body']?.toString() ??
+                                        notifData['gcm.notification.body']?.toString(),
+                                  ) ??
+                                  topRedirect;
+                              if (redirectPath != null && redirectPath.isNotEmpty) {
+                                if (kDebugMode) {
+                                  print('📥 Pending Android après home: $redirectPath');
+                                }
+                                _queueOrNavigateFromNotification(
+                                  redirectPath,
+                                  notifData.isEmpty ? null : notifData,
+                                );
+                                await channel.invokeMethod('clearPendingNotification');
+                              }
+                            }
+                          } catch (_) {}
+                        });
+                      }
+
+                      // Vérification de version non bloquante après affichage
+                      _checkVersionAndGetUpdate().then((update) async {
+                        if (update == null || !context.mounted) return;
+                        final skipDisplay = await VersionCheckPage.shouldSkipUpdateDisplay(update.version);
+                        if (skipDisplay || !context.mounted) return;
+                        Navigator.of(context).push(
+                          MaterialPageRoute(
+                            builder: (context) => VersionCheckPage(update: update),
+                          ),
+                        );
+                      });
+                    });
+                  }
                 }
                 return Scaffold(
                   body: Center(
@@ -1070,11 +1340,6 @@ class MyApp extends StatelessWidget {
             '/dashboard': (context) {
               final provider = Provider.of<BottomNavigationProvider>(context, listen: false);
               provider.updateIndex(0);
-              return const MainNavigationPage();
-            },
-            '/mes-cours': (context) {
-              final provider = Provider.of<BottomNavigationProvider>(context, listen: false);
-              provider.updateIndex(1);
               return const MainNavigationPage();
             },
             '/fil-social': (context) {
@@ -1103,7 +1368,11 @@ class MyApp extends StatelessWidget {
             '/payment-policy': (context) => NavigationWrapper(child: PaymentPolicyPage(), currentRoute: '/payment-policy'),
             '/refund-policy': (context) => NavigationWrapper(child: RefundPolicyPage(), currentRoute: '/refund-policy'),
             '/calendrier': (context) => NavigationWrapper(child: CalendarPage(), currentRoute: '/calendrier'),
-            '/groups': (context) => NavigationWrapper(child: GroupsPage(), currentRoute: '/groups'),
+            '/groups': (context) {
+              final provider = Provider.of<BottomNavigationProvider>(context, listen: false);
+              provider.updateIndex(1);
+              return const MainNavigationPage();
+            },
             '/join-session': (context) => NavigationWrapper(child: JoinSessionPage(), currentRoute: '/join-session'),
             '/invoices': (context) => NavigationWrapper(child: InvoicePage(), currentRoute: '/invoices'),
             '/list-meet': (context) => NavigationWrapper(child: ListMeetPage(), currentRoute: '/list-meet'),

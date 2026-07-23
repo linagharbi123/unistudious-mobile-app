@@ -11,7 +11,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../models/user_model.dart';
 import '../providers/auth_provider.dart';
 import '../models/bottom_navigation_provider.dart';
-import '../screens/main_navigation_page.dart';
+import '../utils/main_navigation_helper.dart';
+import '../utils/session_status_cache.dart';
 
 class AppSidebar extends StatefulWidget {
   const AppSidebar({super.key});
@@ -21,16 +22,13 @@ class AppSidebar extends StatefulWidget {
 }
 
 class _AppSidebarState extends State<AppSidebar> {
-  bool _isLoading = true;
+  bool _isLoading = false;
   String? _errorMessage;
 
   @override
   void initState() {
     super.initState();
-    // Charger immédiatement les données en cache et afficher le sidebar
     _loadCachedDataAndShow();
-    // Charger les données à jour en arrière-plan
-    _checkAuthAndFetchData();
   }
 
   // Charger les données en cache immédiatement pour afficher le sidebar rapidement
@@ -50,10 +48,13 @@ class _AppSidebarState extends State<AppSidebar> {
         return;
       }
 
-      // Appliquer les données en cache immédiatement (sans attendre)
-      unawaited(_applyCachedUser());
+      // Appliquer le cache immédiatement (nom, photo, sessions actives)
+      await _applyCachedUser();
+
+      // Rafraîchir en arrière-plan sans bloquer l'affichage du menu
+      unawaited(_checkSessionStatus());
+      unawaited(_fetchProfileData());
       
-      // Afficher le sidebar immédiatement sans attendre les appels API
       if (mounted) setState(() => _isLoading = false);
     } catch (e) {
       if (mounted) {
@@ -65,32 +66,24 @@ class _AppSidebarState extends State<AppSidebar> {
     }
   }
 
-  // Charger les données à jour en arrière-plan (sans bloquer l'affichage)
-  Future<void> _checkAuthAndFetchData() async {
-    if (!mounted) return;
-    try {
-      final authProvider = Provider.of<AuthProvider>(context, listen: false);
-
-      if (!authProvider.isLoggedIn) {
-        return;
-      }
-
-      // Charger les données à jour en arrière-plan sans bloquer l'UI
-      unawaited(_fetchProfileData());
-      unawaited(_checkSessionStatus());
-    } catch (e) {
-      // Erreurs silencieuses en arrière-plan
-      developer.log('Error in background data fetch: $e', name: 'AppSidebar');
-    }
+  Future<void> _persistSessionStatus(bool hasSession) async {
+    await SessionStatusCache.save(hasSession);
   }
 
   Future<void> _applyCachedUser() async {
     final prefs = await SharedPreferences.getInstance();
     final cachedName = prefs.getString('cached_user_name') ?? '';
     final cachedImageUrl = prefs.getString('cached_user_image_url') ?? '';
-    if ((cachedName.isNotEmpty || cachedImageUrl.isNotEmpty) && mounted) {
-      final userModel = Provider.of<UserModel>(context, listen: false);
+    final cachedHasSession = await SessionStatusCache.load();
+
+    if (!mounted) return;
+    final userModel = Provider.of<UserModel>(context, listen: false);
+
+    if (cachedName.isNotEmpty || cachedImageUrl.isNotEmpty) {
       userModel.updateUser(name: cachedName, imageUrl: cachedImageUrl);
+    }
+    if (cachedHasSession != null) {
+      userModel.hasActiveSession = cachedHasSession;
     }
   }
 
@@ -109,9 +102,12 @@ class _AppSidebarState extends State<AppSidebar> {
       if (response.statusCode == 200) {
         final jsonResponse = jsonDecode(response.body);
         final sessions = jsonResponse['sessions'] as List<dynamic>? ?? [];
-        userModel.hasActiveSession = sessions.isNotEmpty;
+        final hasSession = sessions.isNotEmpty;
+        userModel.hasActiveSession = hasSession;
+        await _persistSessionStatus(hasSession);
       } else {
         userModel.hasActiveSession = false;
+        await _persistSessionStatus(false);
         if (response.statusCode == 401 || response.statusCode == 403) {
           if (!mounted) return;
           ScaffoldMessenger.of(context).showSnackBar(
@@ -124,6 +120,7 @@ class _AppSidebarState extends State<AppSidebar> {
       if (!mounted) return;
       final userModel = Provider.of<UserModel>(context, listen: false);
       userModel.hasActiveSession = false;
+      await _persistSessionStatus(false);
       
       // Détecter les erreurs de connexion et ne pas afficher de snackbar
       final isNetworkError = e is SocketException || 
@@ -262,31 +259,7 @@ class _AppSidebarState extends State<AppSidebar> {
 
   void _go(String routeName) {
     if (!mounted) return;
-    final provider = Provider.of<BottomNavigationProvider>(context, listen: false);
-    // Map of sidebar routes to bottom navigation indices
-    const routeToIndexMap = {
-      '/dashboard': 0,
-      '/mes-cours': 1,
-      '/fil-social': 2,
-      '/ressources': 3,
-      '/profile': 4,
-    };
-
-    Navigator.pop(context); // Close the sidebar
-
-    // Update the bottom navigation index if the route is mapped
-    final newIndex = routeToIndexMap[routeName];
-    if (newIndex != null) {
-      // Pour les routes de la bottom bar, utiliser MainNavigationPage
-      provider.updateIndex(newIndex);
-      Navigator.pushReplacement(
-        context,
-        MaterialPageRoute(builder: (_) => const MainNavigationPage()),
-      );
-    } else {
-      // Pour les autres routes, utiliser la navigation normale
-      Navigator.pushReplacementNamed(context, routeName);
-    }
+    MainNavigationHelper.navigateToRoute(context, routeName);
   }
 
   void _showLogoutConfirmation(BuildContext context) {
@@ -329,8 +302,9 @@ class _AppSidebarState extends State<AppSidebar> {
     );
   }
 
-  void _performLogout(BuildContext context) {
+  void _performLogout(BuildContext context) async {
     try {
+      await SessionStatusCache.clear();
       Provider.of<UserModel>(context, listen: false).updateUser(
         name: '',
         email: '',
@@ -338,7 +312,7 @@ class _AppSidebarState extends State<AppSidebar> {
         hasActiveSession: false,
       );
       Provider.of<AuthProvider>(context, listen: false).logout();
-      Provider.of<BottomNavigationProvider>(context, listen: false).updateIndex(0); // Reset bottom nav index
+      Provider.of<BottomNavigationProvider>(context, listen: false).clearPageCache();
       Navigator.pushReplacementNamed(context, '/welcome');
     } catch (e) {
       if (!mounted) return;
@@ -391,14 +365,6 @@ class _AppSidebarState extends State<AppSidebar> {
                           onTap: () => _go('/dashboard'),
                           theme: theme,
                           isActive: currentRoute == '/dashboard',
-                        ),
-                        _SidebarTile(
-                          icon: Icons.book_outlined,
-                          label: 'Mes cours',
-                          color: color,
-                          onTap: () => _go('/mes-cours'),
-                          theme: theme,
-                          isActive: currentRoute == '/mes-cours',
                         ),
                         _SidebarTile(
                           icon: Icons.add_circle_outlined,
@@ -698,7 +664,7 @@ class _UserProfileCard extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  name.isNotEmpty ? name : 'Utilisateur',
+                  name.trim().isNotEmpty ? name.trim() : 'utilisateur',
                   style: GoogleFonts.poppins(
                     fontSize: 16,
                     fontWeight: FontWeight.w600,

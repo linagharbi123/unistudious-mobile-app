@@ -3,11 +3,16 @@ import Flutter
 //import FacebookCore // Ajout pour le SDK Facebook
 import FBSDKCoreKit
 import UserNotifications
+import FirebaseCore
+import FirebaseMessaging
 import os.log
 
 
 @main
 @objc class AppDelegate: FlutterAppDelegate {
+  /// Redirect en attente si Flutter n'est pas encore prêt (cold start)
+  private var pendingNotificationArguments: [String: Any]?
+  
   override func application(
     _ application: UIApplication,
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
@@ -15,6 +20,10 @@ import os.log
     print("═══════════════════════════════════════════════════════")
     print("🍎 iOS AppDelegate - didFinishLaunchingWithOptions")
     print("═══════════════════════════════════════════════════════")
+    
+    // Initialiser Firebase dès le lancement (requis pour les notifications)
+    FirebaseApp.configure()
+    print("✅ Firebase configuré")
     
     // Initialisation du SDK Facebook
     ApplicationDelegate.shared.application(
@@ -28,29 +37,146 @@ import os.log
       print("✅ UNUserNotificationCenter delegate configuré")
     }
     
-    // Vérifier les options de lancement pour les notifications
+    // IMPORTANT: Enregistrer pour les notifications à distance (APNs)
+    application.registerForRemoteNotifications()
+    print("✅ registerForRemoteNotifications() appelé")
+    
+    // Cold start depuis une notification remote
     if let notification = launchOptions?[.remoteNotification] as? [String: Any] {
       print("📱 App lancée depuis une notification")
       print("  Notification data: \(notification)")
-      
-      // Extraire le paramètre redirect si présent
-      let redirectPath = notification["redirect"] as? String ?? 
-                        notification["location"] as? String ?? 
-                        notification["route"] as? String
-      
-      if let redirect = redirectPath {
-        print("  📍 Paramètre redirect trouvé au lancement: '\(redirect)'")
-        // Le canal de méthode sera configuré plus tard dans Flutter
-        // et récupérera ce paramètre via getInitialMessage()
+      if let args = Self.buildNotificationArguments(from: notification) {
+        pendingNotificationArguments = args
+        print("  📍 Redirect cold start mis en attente: \(args["redirect"] ?? "")")
       }
     }
     
     // Initialisation des plugins Flutter
     GeneratedPluginRegistrant.register(with: self)
     print("✅ Plugins Flutter enregistrés")
+    
+    // Configurer les canaux de méthode
+    DispatchQueue.main.async {
+      guard let controller = self.window?.rootViewController as? FlutterViewController else { return }
+      
+      // Canal pour ré-enregistrer les notifications (iOS) quand l'utilisateur accorde la permission
+      let notificationChannel = FlutterMethodChannel(
+        name: "com.unistudious.projet1v2/notifications",
+        binaryMessenger: controller.binaryMessenger
+      )
+      notificationChannel.setMethodCallHandler { [weak self] (call, result) in
+        if call.method == "registerForRemoteNotifications" {
+          UIApplication.shared.registerForRemoteNotifications()
+          print("✅ registerForRemoteNotifications() appelé depuis Flutter")
+          result(true)
+        } else {
+          result(FlutterMethodNotImplemented)
+        }
+      }
+      
+      // Canal pour ouvrir l'App Store
+      let appStoreChannel = FlutterMethodChannel(
+        name: "com.unistudious.projet1v2/appstore",
+        binaryMessenger: controller.binaryMessenger
+      )
+      appStoreChannel.setMethodCallHandler { (call, result) in
+        if call.method == "openAppStore" {
+          guard let args = call.arguments as? [String: Any],
+                let appId = args["appStoreId"] as? String else {
+            result(FlutterError(code: "INVALID_ARGS", message: "appStoreId required", details: nil))
+            return
+          }
+          let urlString = "itms-apps://itunes.apple.com/app/id\(appId)"
+          guard let url = URL(string: urlString) else {
+            result(FlutterError(code: "INVALID_URL", message: "Invalid App Store URL", details: nil))
+            return
+          }
+          UIApplication.shared.open(url) { success in
+            result(success)
+          }
+        } else {
+          result(FlutterMethodNotImplemented)
+        }
+      }
+      print("✅ Canal App Store enregistré")
+      
+      // Envoyer le redirect cold start une fois Flutter prêt
+      self.flushPendingNotificationToFlutter(delay: 1.0)
+    }
     print("═══════════════════════════════════════════════════════")
     
     return super.application(application, didFinishLaunchingWithOptions: launchOptions)
+  }
+  
+  /// Extrait redirect/direction/location/route/action depuis userInfo FCM/APNs
+  private static func extractRedirect(from userInfo: [AnyHashable: Any]) -> String? {
+    let keys = ["redirect", "direction", "location", "route", "action"]
+    for key in keys {
+      if let value = userInfo[key] as? String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty && trimmed.lowercased() != "flutter_notification_click" {
+          return trimmed
+        }
+      }
+    }
+    // Parfois FCM nest les data sous "data" ou "gcm"
+    if let data = userInfo["data"] as? [AnyHashable: Any] {
+      return extractRedirect(from: data)
+    }
+    if let gcm = userInfo["gcm.notification.data"] as? String,
+       let data = gcm.data(using: .utf8),
+       let json = try? JSONSerialization.jsonObject(with: data) as? [AnyHashable: Any] {
+      return extractRedirect(from: json)
+    }
+    return nil
+  }
+  
+  private static func buildNotificationArguments(from userInfo: [AnyHashable: Any]) -> [String: Any]? {
+    guard let redirect = extractRedirect(from: userInfo) else { return nil }
+    var arguments: [String: Any] = ["redirect": redirect]
+    var dataDict: [String: String] = ["redirect": redirect]
+    for (key, value) in userInfo {
+      let keyStr = (key as? String) ?? String(describing: key)
+      // Ignorer les clés système APNs / FCM volumineuses
+      if keyStr == "aps" || keyStr.hasPrefix("google.") || keyStr.hasPrefix("gcm.") {
+        continue
+      }
+      dataDict[keyStr] = (value as? String) ?? String(describing: value)
+    }
+    arguments["data"] = dataDict
+    return arguments
+  }
+  
+  private func sendNotificationArgumentsToFlutter(_ arguments: [String: Any], attempt: Int = 1) {
+    guard let controller = window?.rootViewController as? FlutterViewController else {
+      if attempt < 5 {
+        let delay = Double(attempt) * 0.5
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+          self?.sendNotificationArgumentsToFlutter(arguments, attempt: attempt + 1)
+        }
+      } else {
+        pendingNotificationArguments = arguments
+        print("  ⚠️ FlutterViewController indisponible, redirect mis en attente")
+      }
+      return
+    }
+    let channel = FlutterMethodChannel(
+      name: "com.unistudious.projet1v2/notification",
+      binaryMessenger: controller.binaryMessenger
+    )
+    channel.invokeMethod("onNotificationOpened", arguments: arguments)
+    print("  ✅ Redirect envoyé à Flutter: '\(arguments["redirect"] ?? "")' (tentative \(attempt))")
+  }
+  
+  private func flushPendingNotificationToFlutter(delay: Double) {
+    guard let args = pendingNotificationArguments else { return }
+    DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+      guard let self = self else { return }
+      // Ne flush que si toujours en attente
+      guard self.pendingNotificationArguments != nil else { return }
+      self.pendingNotificationArguments = nil
+      self.sendNotificationArgumentsToFlutter(args)
+    }
   }
   
   // Présenter les notifications même quand l'app est en foreground
@@ -63,50 +189,18 @@ import os.log
     print("═══════════════════════════════════════════════════════")
     print("🍎 iOS - NOTIFICATION REÇUE EN FOREGROUND")
     print("═══════════════════════════════════════════════════════")
-    print("Date: \(notification.date)")
     print("Identifier: \(notification.request.identifier)")
     
     let content = notification.request.content
-    print("--- CONTENU DE LA NOTIFICATION ---")
     print("  Title: \(content.title)")
     print("  Body: \(content.body)")
-    print("  Subtitle: \(content.subtitle)")
-    print("  Badge: \(content.badge?.intValue ?? 0)")
-    print("  Sound: \(content.sound?.description ?? "none")")
-    print("  Category Identifier: \(content.categoryIdentifier)")
-    print("  Thread Identifier: \(content.threadIdentifier)")
-    print("  Target Content ID: \(content.targetContentIdentifier ?? "none")")
+    print("  UserInfo count: \(content.userInfo.count)")
     
-    print("--- USER INFO ---")
-    if content.userInfo.isEmpty {
-      print("  ⚠️ Aucune donnée dans userInfo")
-    } else {
-      print("  Nombre de données: \(content.userInfo.count)")
-      for (key, value) in content.userInfo {
-        print("  \(key): \(value)")
-      }
-    }
-    
-    print("--- ATTACHMENTS ---")
-    if content.attachments.isEmpty {
-      print("  Aucune pièce jointe")
-    } else {
-      print("  Nombre de pièces jointes: \(content.attachments.count)")
-      for (index, attachment) in content.attachments.enumerated() {
-        print("  [\(index)] Identifier: \(attachment.identifier)")
-        print("  [\(index)] URL: \(attachment.url)")
-        print("  [\(index)] Type: \(attachment.type)")
-      }
-    }
-    
-    // Afficher la notification même en foreground
     let options: UNNotificationPresentationOptions
     if #available(iOS 14.0, *) {
       options = [.banner, .sound, .badge]
-      print("✅ Options iOS 14+: banner, sound, badge")
     } else {
       options = [.alert, .sound, .badge]
-      print("✅ Options iOS 10-13: alert, sound, badge")
     }
     
     print("═══════════════════════════════════════════════════════")
@@ -124,52 +218,42 @@ import os.log
     print("🍎 iOS - NOTIFICATION OUVERTE PAR L'UTILISATEUR")
     print("═══════════════════════════════════════════════════════")
     print("Action Identifier: \(response.actionIdentifier)")
-    print("Notification Identifier: \(response.notification.request.identifier)")
     
-    let content = response.notification.request.content
-    print("--- CONTENU ---")
-    print("  Title: \(content.title)")
-    print("  Body: \(content.body)")
-    print("  UserInfo: \(content.userInfo)")
+    let userInfo = response.notification.request.content.userInfo
+    print("  UserInfo: \(userInfo)")
     
-    // Extraire le paramètre redirect ou location du userInfo
-    let userInfo = content.userInfo
-    let redirectPath = userInfo["redirect"] as? String ?? 
-                      userInfo["location"] as? String ?? 
-                      userInfo["route"] as? String
-    
-    if let redirect = redirectPath {
-      print("  📍 Paramètre redirect/location trouvé: '\(redirect)'")
-      
-      // Envoyer le paramètre redirect à Flutter via un canal de méthode
-      // Attendre que Flutter soit initialisé
-      DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-        if let controller = self.window?.rootViewController as? FlutterViewController {
-          let channel = FlutterMethodChannel(name: "com.unistudious.projet1v2/notification",
-                                            binaryMessenger: controller.binaryMessenger)
-          channel.invokeMethod("onNotificationOpened", arguments: ["redirect": redirect])
-          print("  ✅ Paramètre redirect envoyé à Flutter: '\(redirect)'")
-        } else {
-          print("  ⚠️ Impossible d'obtenir FlutterViewController pour envoyer redirect, nouvelle tentative...")
-          // Nouvelle tentative après un délai plus long
-          DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-            if let controller = self.window?.rootViewController as? FlutterViewController {
-              let channel = FlutterMethodChannel(name: "com.unistudious.projet1v2/notification",
-                                                binaryMessenger: controller.binaryMessenger)
-              channel.invokeMethod("onNotificationOpened", arguments: ["redirect": redirect])
-              print("  ✅ Paramètre redirect envoyé à Flutter (tentative 2): '\(redirect)'")
-            }
-          }
-        }
+    if let arguments = Self.buildNotificationArguments(from: userInfo) {
+      print("  📍 Paramètre redirect trouvé: '\(arguments["redirect"] ?? "")'")
+      // Court délai pour laisser Flutter/navigator se stabiliser
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+        self?.sendNotificationArgumentsToFlutter(arguments)
       }
     } else {
-      print("  ⚠️ Aucun paramètre redirect/location trouvé dans userInfo")
+      print("  ⚠️ Aucun paramètre redirect/direction/location trouvé dans userInfo")
     }
     
     print("═══════════════════════════════════════════════════════")
     completionHandler()
   }
 
+  // Transmettre le token APNs à Firebase pour que FCM puisse livrer les notifications
+  override func application(
+    _ application: UIApplication,
+    didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data
+  ) {
+    print("🍎 iOS - Token APNs reçu, transmission à Firebase...")
+    Messaging.messaging().apnsToken = deviceToken
+    print("✅ Token APNs transmis à Firebase Messaging")
+  }
+  
+  // Gestion des erreurs d'enregistrement aux notifications
+  override func application(
+    _ application: UIApplication,
+    didFailToRegisterForRemoteNotificationsWithError error: Error
+  ) {
+    print("⚠️ iOS - Échec enregistrement notifications: \(error.localizedDescription)")
+  }
+  
   override func application(
     _ app: UIApplication,
     open url: URL,

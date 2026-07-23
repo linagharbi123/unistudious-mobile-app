@@ -416,6 +416,7 @@ class _ProfilePageState extends State<ProfilePage> {
                   label: 'Nom d\'utilisateur',
                   controller: _usernameController,
                   validator: (v) => v!.isEmpty ? 'Entrez votre nom d\'utilisateur' : null,
+                  readOnly: true,
                 ),
                 const SizedBox(height: 16),
                 _buildTextField(
@@ -429,6 +430,7 @@ class _ProfilePageState extends State<ProfilePage> {
                     }
                     return null;
                   },
+                  readOnly: true,
                 ),
                 const SizedBox(height: 16),
                 _buildTextField(
@@ -523,6 +525,7 @@ class _ProfilePageState extends State<ProfilePage> {
     TextInputType keyboardType = TextInputType.text,
     int? maxLength,
     bool isDateField = false,
+    bool readOnly = false,
   }) {
     final theme = Theme.of(context);
     return Card(
@@ -533,7 +536,7 @@ class _ProfilePageState extends State<ProfilePage> {
         controller: controller,
         keyboardType: keyboardType,
         maxLength: maxLength,
-        readOnly: isDateField,
+        readOnly: isDateField || readOnly,
         onTap: isDateField ? () => _selectDate(context) : null,
         decoration: InputDecoration(
           counterText: maxLength != null ? '' : null,

@@ -20,6 +20,8 @@ import 'blocked_users_page.dart';
 import 'notifications_list_page.dart';
 import '../providers/notifications_list_provider.dart';
 import '../widgets/notification_icon_button.dart';
+import '../services/tutorial_service.dart';
+import '../utils/main_navigation_helper.dart';
 
 class SettingsPage extends StatefulWidget {
   @override
@@ -123,7 +125,8 @@ class _SettingsPageState extends State<SettingsPage> {
         child: ListView(
           padding: const EdgeInsets.all(16.0),
           children: [
-            _buildSectionTitle('Profil', theme),
+            // ── Compte ──────────────────────────────────────────
+            _buildSectionTitle('Compte', theme),
             _buildMenuItem(
               icon: Icons.person,
               title: 'Profil et informations personnelles',
@@ -135,47 +138,9 @@ class _SettingsPageState extends State<SettingsPage> {
               },
               theme: theme,
             ),
-            _buildSectionTitle('Sécurité', theme),
-            _buildMenuItem(
-              icon: Icons.lock,
-              title: 'Mot de passe et authentification',
-              onTap: () {
-                Navigator.push(
-                  context,
-                  MaterialPageRoute(builder: (context) => PasswordAuthPage()),
-                );
-              },
-              theme: theme,
-            ),
-            _buildMenuItem(
-              icon: Icons.delete_forever,
-              iconColor: Colors.redAccent,
-              title: 'Supprimer mon compte',
-              subtitle:
-                  'Suppression définitive du compte après vérification par e-mail',
-              textColor: Colors.redAccent,
-              onTap: () {
-                Navigator.push(
-                  context,
-                  MaterialPageRoute(
-                    builder: (context) => const DeleteAccountPage(),
-                  ),
-                );
-              },
-              theme: theme,
-            ),
-            _buildMenuItem(
-              icon: Icons.block,
-              title: 'Utilisateurs bloqués',
-              onTap: () {
-                Navigator.push(
-                  context,
-                  MaterialPageRoute(builder: (context) => const BlockedUsersPage()),
-                );
-              },
-              theme: theme,
-            ),
-            _buildSectionTitle('Email et notifications', theme),
+
+            // ── Notifications ───────────────────────────────────
+            _buildSectionTitle('Notifications', theme),
             _buildMenuItem(
               icon: Icons.notifications,
               title: 'Notifications push',
@@ -203,7 +168,9 @@ class _SettingsPageState extends State<SettingsPage> {
                 );
               },
             ),
-            _buildSectionTitle('Préférences', theme),
+
+            // ── Apparence ───────────────────────────────────────
+            _buildSectionTitle('Apparence', theme),
             _buildMenuItem(
               icon: Icons.color_lens,
               title: 'Thème et personnalisation',
@@ -215,14 +182,55 @@ class _SettingsPageState extends State<SettingsPage> {
               },
               theme: theme,
             ),
-            _buildSectionTitle('À propos', theme),
+
+            // ── Aide ────────────────────────────────────────────
+            _buildSectionTitle('Aide', theme),
             _buildMenuItem(
-              icon: Icons.cookie,
-              title: 'Politique de Cookies',
+              icon: Icons.school_outlined,
+              title: 'Revoir le tutoriel',
+              subtitle: 'Découvrir les fonctionnalités de l\'application',
+              onTap: () async {
+                await TutorialService.requestReplay();
+                if (!context.mounted) return;
+                MainNavigationHelper.navigateToTab(context, 0);
+              },
+              theme: theme,
+            ),
+
+            // ── Sécurité ────────────────────────────────────────
+            _buildSectionTitle('Sécurité', theme),
+            _buildMenuItem(
+              icon: Icons.lock,
+              title: 'Mot de passe et authentification',
               onTap: () {
                 Navigator.push(
                   context,
-                  MaterialPageRoute(builder: (_) => const CookiePolicyPage()),
+                  MaterialPageRoute(builder: (context) => PasswordAuthPage()),
+                );
+              },
+              theme: theme,
+            ),
+            _buildMenuItem(
+              icon: Icons.block,
+              title: 'Utilisateurs bloqués',
+              onTap: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (context) => const BlockedUsersPage()),
+                );
+              },
+              theme: theme,
+            ),
+
+            // ── Informations légales ────────────────────────────
+            _buildSectionTitle('Informations légales', theme),
+            _buildMenuItem(
+              icon: Icons.security,
+              title: 'Politique de confidentialité',
+              onTap: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (context) => PrivacyPolicyPage()),
                 );
               },
               theme: theme,
@@ -239,12 +247,12 @@ class _SettingsPageState extends State<SettingsPage> {
               theme: theme,
             ),
             _buildMenuItem(
-              icon: Icons.security,
-              title: 'Politique de confidentialité',
+              icon: Icons.cookie,
+              title: 'Politique de Cookies',
               onTap: () {
                 Navigator.push(
                   context,
-                  MaterialPageRoute(builder: (context) => PrivacyPolicyPage()),
+                  MaterialPageRoute(builder: (_) => const CookiePolicyPage()),
                 );
               },
               theme: theme,
@@ -261,7 +269,7 @@ class _SettingsPageState extends State<SettingsPage> {
               theme: theme,
             ),
             _buildMenuItem(
-              icon: Icons.payment,
+              icon: Icons.replay,
               title: 'Politique de Remboursement',
               onTap: () {
                 Navigator.push(
@@ -271,14 +279,35 @@ class _SettingsPageState extends State<SettingsPage> {
               },
               theme: theme,
             ),
+
+            // ── Gestion du compte (actions sensibles en bas) ────
+            _buildSectionTitle('Gestion du compte', theme),
             _buildMenuItem(
               icon: Icons.logout,
-              iconColor: Colors.red, // Fixed from IconColor to iconColor
+              iconColor: Colors.red,
               title: 'Déconnexion',
               textColor: Colors.red,
               onTap: () => _showLogoutConfirmation(context),
               theme: theme,
             ),
+            _buildMenuItem(
+              icon: Icons.delete_forever,
+              iconColor: Colors.redAccent,
+              title: 'Supprimer mon compte',
+              subtitle:
+                  'Suppression définitive du compte après vérification par e-mail',
+              textColor: Colors.redAccent,
+              onTap: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (context) => const DeleteAccountPage(),
+                  ),
+                );
+              },
+              theme: theme,
+            ),
+            const SizedBox(height: 16),
           ],
         ),
       ),

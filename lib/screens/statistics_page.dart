@@ -6,9 +6,7 @@ import 'package:http/http.dart' as http;
 import 'dart:convert';
 import '../providers/auth_provider.dart';
 import '../providers/theme_provider.dart';
-import 'resources_page.dart';
-import 'calendar_page.dart';
-import 'invoice_page.dart';
+import '../utils/main_navigation_helper.dart';
 
 class StatisticsPage extends StatefulWidget {
   const StatisticsPage({super.key});
@@ -132,7 +130,7 @@ class _StatisticsPageState extends State<StatisticsPage> {
           "Consultez et gérez vos ressources.",
           Icons.folder,
           Colors.indigo,
-          const ResourcesPage(),
+          '/ressources',
         ),
         const SizedBox(height: 12),
         _pageCard(
@@ -141,7 +139,7 @@ class _StatisticsPageState extends State<StatisticsPage> {
           "Consultez et gérez votre calendrier.",
           Icons.calendar_month,
           Colors.deepPurple,
-          CalendarPage(),
+          '/calendrier',
         ),
         const SizedBox(height: 12),
         _pageCard(
@@ -150,13 +148,28 @@ class _StatisticsPageState extends State<StatisticsPage> {
           "Consultez et gérez vos factures ici.",
           Icons.receipt_long,
           Colors.orange,
-          const InvoicePage(),
+          '/invoices',
         ),
       ],
     );
   }
 
-  Widget _pageCard(BuildContext context, String title, String desc, IconData icon, Color color, Widget page) {
+  void _navigateToPopularPage(String routeName) {
+    final tabIndex = MainNavigationHelper.indexForRoute(routeName);
+    final navigator = Navigator.of(context);
+    navigator.pop();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final rootContext = navigator.context;
+      if (!rootContext.mounted) return;
+      if (tabIndex != null) {
+        MainNavigationHelper.switchToTab(rootContext, tabIndex);
+      } else {
+        Navigator.pushNamed(rootContext, routeName);
+      }
+    });
+  }
+
+  Widget _pageCard(BuildContext context, String title, String desc, IconData icon, Color color, String routeName) {
     final theme = Theme.of(context);
     return Center(
       child: ConstrainedBox(
@@ -197,12 +210,7 @@ class _StatisticsPageState extends State<StatisticsPage> {
                     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(25)),
                     padding: const EdgeInsets.symmetric(horizontal: 28, vertical: 10),
                   ),
-                  onPressed: () {
-                    Navigator.push(
-                      context,
-                      MaterialPageRoute(builder: (context) => page),
-                    );
-                  },
+                  onPressed: () => _navigateToPopularPage(routeName),
                   child: Text(
                     "Ouvrir",
                     style: GoogleFonts.poppins(

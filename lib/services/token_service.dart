@@ -14,6 +14,7 @@ class TokenService {
 
   String? _currentToken;
   String? _refreshToken;
+  bool _loginInProgress = false;
 
   // Getter pour le token actuel
   String? get currentToken => _currentToken;
@@ -52,6 +53,10 @@ class TokenService {
 
   // Login et récupération des tokens
   Future<Map<String, dynamic>> login(String username, String password) async {
+    if (_loginInProgress) {
+      return {'success': false, 'error': 'Connexion en cours'};
+    }
+    _loginInProgress = true;
     try {
       final response = await http.post(
         Uri.parse('$_baseUrl/api/login_check'),
@@ -75,9 +80,18 @@ class TokenService {
           'refresh_token': refreshToken,
         };
       } else {
+        String errorMessage = 'Login failed: ${response.statusCode}';
+        try {
+          final body = json.decode(response.body);
+          if (body is Map && body['message'] != null) {
+            errorMessage = body['message'].toString();
+          } else if (body is Map && body['error'] != null) {
+            errorMessage = body['error'].toString();
+          }
+        } catch (_) {}
         return {
           'success': false,
-          'error': 'Login failed: ${response.statusCode}',
+          'error': errorMessage,
         };
       }
     } catch (e) {
@@ -85,6 +99,8 @@ class TokenService {
         'success': false,
         'error': 'Network error: $e',
       };
+    } finally {
+      _loginInProgress = false;
     }
   }
 
@@ -105,6 +121,9 @@ class TokenService {
           'refresh_token': _refreshToken,
         }),
       );
+
+      print('[TokenService] /api/token/refresh status: ${response.statusCode}');
+      print('[TokenService] /api/token/refresh response: ${response.body}');
 
       if (response.statusCode == 200) {
         final data = json.decode(response.body);

@@ -550,7 +550,16 @@ class _FavoritesPageState extends State<FavoritesPage> {
   }
 
   String _stripHtml(String html) {
-    final stripped = html.replaceAll(RegExp(r'<[^>]*>'), '').trim();
+    // Convertir les sauts de ligne HTML en \n avant de supprimer les balises
+    final stripped = html
+        .replaceAll(RegExp(r'<br\s*/?>', caseSensitive: false), '\n')
+        .replaceAll(RegExp(r'</p\s*>', caseSensitive: false), '\n')
+        .replaceAll(RegExp(r'</div\s*>', caseSensitive: false), '\n')
+        .replaceAll(RegExp(r'</li\s*>', caseSensitive: false), '\n')
+        .replaceAll(RegExp(r'<[^>]*>'), '')
+        .replaceAll(RegExp(r'[ \t]+\n'), '\n')
+        .replaceAll(RegExp(r'\n{3,}'), '\n\n')
+        .trim();
     developer.log(
         '🔵 Stripped HTML: "${html.substring(0, html.length > 50 ? 50 : html.length)}..." -> "${stripped.substring(0, stripped.length > 50 ? 50 : stripped.length)}..."',
         name: 'FavoritesPage');

@@ -518,6 +518,7 @@ class _GroupesPageState extends State<GroupesPage> {
   // ==================== NOUVELLE BOÎTE DE DIALOGUE ====================
   Future<void> _createNewChannel() async {
     final TextEditingController nameController = TextEditingController();
+    final TextEditingController searchController = TextEditingController();
     final List<String> selectedMembers = [];
     bool readOnly = false;
 
@@ -622,6 +623,24 @@ class _GroupesPageState extends State<GroupesPage> {
                       style: GoogleFonts.poppins(color: hintColor, fontSize: 14),
                     ),
                     const SizedBox(height: 8),
+                    TextField(
+                      controller: searchController,
+                      style: TextStyle(color: textColor),
+                      onChanged: (_) => setStateDialog(() {}),
+                      decoration: InputDecoration(
+                        hintText: 'Rechercher par nom ou pseudo...',
+                        hintStyle: TextStyle(color: hintColor),
+                        prefixIcon: Icon(Icons.search, color: hintColor),
+                        filled: true,
+                        fillColor: cardBg,
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(8),
+                          borderSide: BorderSide(color: primary),
+                        ),
+                        contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                      ),
+                    ),
+                    const SizedBox(height: 8),
                     Container(
                       constraints: const BoxConstraints(maxHeight: 200),
                       decoration: BoxDecoration(
@@ -639,11 +658,29 @@ class _GroupesPageState extends State<GroupesPage> {
                       )
                           : allUsers.isEmpty
                           ? const Center(child: Text('Aucun membre disponible'))
-                          : ListView.builder(
-                        shrinkWrap: true,
-                        itemCount: allUsers.length,
-                        itemBuilder: (context, index) {
-                          final user = allUsers[index];
+                          : Builder(
+                        builder: (context) {
+                          final query = searchController.text.trim().toLowerCase();
+                          final filteredUsers = query.isEmpty
+                              ? allUsers
+                              : allUsers.where((u) {
+                                  final name = (u['name']?.toString() ?? '').toLowerCase();
+                                  final username = (u['username']?.toString() ?? '').toLowerCase();
+                                  return name.contains(query) || username.contains(query);
+                                }).toList();
+                          if (filteredUsers.isEmpty) {
+                            return Center(
+                              child: Text(
+                                'Aucun utilisateur trouvé',
+                                style: TextStyle(color: hintColor),
+                              ),
+                            );
+                          }
+                          return ListView.builder(
+                            shrinkWrap: true,
+                            itemCount: filteredUsers.length,
+                            itemBuilder: (context, index) {
+                              final user = filteredUsers[index];
                           final String userId = user['id']?.toString() ?? '';
                           final String userName = user['name']?.toString() ?? 'Sans nom';
                           final String avatarUrl = user['avatar']?.toString() ?? '';
@@ -673,6 +710,8 @@ class _GroupesPageState extends State<GroupesPage> {
                               });
                             },
                           );
+                        },
+                      );
                         },
                       ),
                     ),
@@ -707,7 +746,10 @@ class _GroupesPageState extends State<GroupesPage> {
                         : () async {
                       Navigator.pop(dialogContext);
                       final loadingProvider = Provider.of<LoadingProvider>(pageContext, listen: false);
-                      loadingProvider.showLoading();
+                      // Différer showLoading pour éviter _dependents.isEmpty pendant la fermeture du dialogue
+                      WidgetsBinding.instance.addPostFrameCallback((_) {
+                        if (pageContext.mounted) loadingProvider.showLoading();
+                      });
                       try {
                         final response = await authProvider.authenticatedRequest(
                           'POST',
@@ -723,28 +765,31 @@ class _GroupesPageState extends State<GroupesPage> {
                           final jsonResponse = jsonDecode(response.body);
                           if (jsonResponse['status'] == 'success' && jsonResponse['data']?['channel'] != null) {
                             final channel = jsonResponse['data']['channel'];
-
-                            // Met à jour le canal Rocket.Chat en lecture seule si nécessaire
                             final String? roomId = channel['_id']?.toString();
+
+                            // Différer hideLoading au prochain frame pour éviter _dependents.isEmpty
+                            WidgetsBinding.instance.addPostFrameCallback((_) {
+                              loadingProvider.hideLoading();
+                            });
+
+                            // Met à jour le canal Rocket.Chat en lecture seule en arrière-plan (sans bloquer l'UI)
                             if (roomId != null && roomId.isNotEmpty) {
-                              try {
-                                await authProvider.authenticatedRequest(
-                                  'POST',
-                                  '/api/chat/channel-update-read-only',
-                                  headers: {
-                                    // On force le form-data (x-www-form-urlencoded)
-                                    'Content-Type': 'application/x-www-form-urlencoded',
-                                  },
-                                  body:
-                                      'roomId=$roomId&readOnly=${readOnly ? 'true' : 'false'}',
-                                );
-                              } catch (e, s) {
+                              authProvider.authenticatedRequest(
+                                'POST',
+                                '/api/chat/channel-update-read-only',
+                                headers: {
+                                  'Content-Type': 'application/x-www-form-urlencoded',
+                                },
+                                body:
+                                    'roomId=$roomId&readOnly=${readOnly ? 'true' : 'false'}',
+                              ).timeout(const Duration(seconds: 10)).catchError((e, s) {
                                 developer.log(
-                                  'Error channel-update-read-only: $e',
+                                  'Error channel-update-read-only (background): $e',
                                   error: e,
                                   stackTrace: s,
                                 );
-                              }
+                                return null;
+                              });
                             }
 
                             final newChannelMap = {
@@ -770,7 +815,9 @@ class _GroupesPageState extends State<GroupesPage> {
                       } catch (e) {
                         // Erreur silencieuse
                       } finally {
-                        if (mounted) loadingProvider.hideLoading();
+                        WidgetsBinding.instance.addPostFrameCallback((_) {
+                          loadingProvider.hideLoading();
+                        });
                       }
                     },
                     style: ElevatedButton.styleFrom(
@@ -791,6 +838,11 @@ class _GroupesPageState extends State<GroupesPage> {
         ),
       ),
     );
+    // Différer le dispose pour éviter "used after disposed" pendant l'animation de fermeture du dialogue
+    Future.delayed(const Duration(milliseconds: 400), () {
+      searchController.dispose();
+      nameController.dispose();
+    });
   }
   // ====================================================================
 

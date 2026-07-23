@@ -7,6 +7,12 @@ class AppConfig {
   static String? _buildNumber;
   static PackageInfo? _packageInfo;
   static bool _initialized = false;
+
+  /// Ré-initialise AppConfig pour récupérer la version actuelle (utile au retour du Play Store/App Store)
+  static Future<void> reinitialize() async {
+    _initialized = false;
+    await initialize();
+  }
   
   // TEMPORAIRE POUR TEST: Mettre à true pour tester la page de mise à jour avec une version ancienne
   static const bool _testMode = false;  // Changez à true pour tester
@@ -80,5 +86,11 @@ class AppConfig {
 
   // Getter pour la version complète (version+buildNumber)
   static String get fullVersion => '$version+$buildNumber';
+
+  /// ID de l'application sur l'App Store (trouvable dans App Store Connect)
+  static const String appStoreId = '6756975616';
+
+  /// URL de la page de l'app sur l'App Store
+  static String get appStoreUrl => 'https://apps.apple.com/app/id$appStoreId';
 }
 

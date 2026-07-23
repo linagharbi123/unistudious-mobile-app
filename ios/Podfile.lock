@@ -162,10 +162,10 @@ PODS:
     - GTMSessionFetcher/Core
   - image_picker_ios (0.0.1):
     - Flutter
-  - jitsi_meet_flutter_sdk (11.4.0):
+  - jitsi_meet_flutter_sdk (11.6.0):
     - Flutter
-    - JitsiMeetSDK (= 11.4.0)
-  - JitsiMeetSDK (11.4.0):
+    - JitsiMeetSDK (= 11.6.0)
+  - JitsiMeetSDK (11.6.0):
     - Giphy (= 2.2.12)
     - JitsiWebRTC (~> 124.0)
   - JitsiWebRTC (124.0.2)
@@ -413,8 +413,8 @@ SPEC CHECKSUMS:
   GTMAppAuth: f69bd07d68cd3b766125f7e072c45d7340dea0de
   GTMSessionFetcher: 5aea5ba6bd522a239e236100971f10cb71b96ab6
   image_picker_ios: 7fe1ff8e34c1790d6fff70a32484959f563a928a
-  jitsi_meet_flutter_sdk: 85a6b67a2830319545e0f2eeb328bb868ac5afc2
-  JitsiMeetSDK: 7d779172ac5b2fd7790ce8959f1e0dc71cd85b32
+  jitsi_meet_flutter_sdk: 95ffad4e2b108c3d5e3f1e0052c9c2d11529820d
+  JitsiMeetSDK: 59a1ae2726b04581126c05856c6dfac053ab3be1
   JitsiWebRTC: b47805ab5668be38e7ee60e2258f49badfe8e1d0
   just_audio: 4e391f57b79cad2b0674030a00453ca5ce817eed
   libwebp: 02b23773aedb6ff1fd38cec7a77b81414c6842a8

@@ -361,6 +361,7 @@ class _ResourcesPageState extends State<ResourcesPage> with SingleTickerProvider
   List<String> sessionTabs = ['Tous'];
   TabController? _tabController;
   bool isConnectionError = false;
+  bool isLoading = true;
   Timer? _connectionCheckTimer;
   bool _hasLoadedData = false; // Indique si les données ont été chargées au moins une fois
 
@@ -417,6 +418,10 @@ class _ResourcesPageState extends State<ResourcesPage> with SingleTickerProvider
         onTap: (index) {
           setState(() {
             selectedSession = sessionTabs[index];
+            isLoading = true;
+          });
+          _fetchResources().whenComplete(() {
+            if (mounted) setState(() => isLoading = false);
           });
         },
       );
@@ -439,11 +444,11 @@ class _ResourcesPageState extends State<ResourcesPage> with SingleTickerProvider
 
   Future<void> _initializeData() async {
     final authProvider = Provider.of<AuthProvider>(context, listen: false);
-    final loadingProvider = Provider.of<LoadingProvider>(context, listen: false);
 
     setState(() {
       isConnectionError = false;
-      _hasLoadedData = false; // Réinitialiser lors d'un nouveau chargement
+      isLoading = true;
+      _hasLoadedData = false;
     });
 
     if (!authProvider.isLoggedIn) {
@@ -455,12 +460,12 @@ class _ResourcesPageState extends State<ResourcesPage> with SingleTickerProvider
     }
 
     try {
-      loadingProvider.showLoading();
-      await Future.delayed(const Duration(milliseconds: 300)); // Ensure animation is visible
       await _fetchSessions();
       await _fetchResources();
+    } catch (_) {
+      // Erreurs gérées dans les méthodes de fetch
     } finally {
-      loadingProvider.hideLoading();
+      if (mounted) setState(() => isLoading = false);
     }
   }
 
@@ -492,6 +497,7 @@ class _ResourcesPageState extends State<ResourcesPage> with SingleTickerProvider
           );
           isConnectionError = false;
         });
+        _updateAppBarTabBar();
       } else {
         // Ne pas afficher de snackbar pour les erreurs (gérées dans le catch)
         if (mounted && response.statusCode != 401 && response.statusCode != 403) {
@@ -524,31 +530,129 @@ class _ResourcesPageState extends State<ResourcesPage> with SingleTickerProvider
     }
   }
 
-  Future<void> _fetchResources() async {
-    final authProvider = Provider.of<AuthProvider>(context, listen: false);
+  int? _selectedSessionId() {
+    if (selectedSession == 'Tous') return null;
+    final session = sessions.firstWhere(
+      (s) => s['name'] == selectedSession,
+      orElse: () => {'id': null},
+    );
+    return session['id'] as int?;
+  }
+
+  String _sessionNamesFromIds(List<dynamic> sessionIds) {
+    if (sessionIds.isEmpty) return 'Session inconnue';
+    final names = sessionIds.map((id) {
+      final session = sessions.firstWhere(
+        (s) => s['id'] == id,
+        orElse: () => {'name': 'Session $id'},
+      );
+      return session['name'] as String;
+    }).toList();
+    return names.join(', ');
+  }
+
+  String _formatTeacherFileDate(dynamic createdAt) {
+    String? raw;
+    if (createdAt is Map && createdAt['date'] != null) {
+      raw = createdAt['date'].toString();
+    } else if (createdAt is String) {
+      raw = createdAt;
+    }
+    if (raw == null || raw.isEmpty) return 'Inconnu';
 
     try {
-      final foldersResponse = await authProvider.authenticatedRequest(
-        'GET',
-        '/api/get-share-resource-folder',
+      final dt = DateTime.parse(raw);
+      final y = dt.year.toString().padLeft(4, '0');
+      final m = dt.month.toString().padLeft(2, '0');
+      final d = dt.day.toString().padLeft(2, '0');
+      final h = dt.hour.toString().padLeft(2, '0');
+      final min = dt.minute.toString().padLeft(2, '0');
+      return '$y-$m-$d $h:$min';
+    } catch (_) {
+      final match = RegExp(r'^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2})').firstMatch(raw);
+      if (match != null) return '${match.group(1)} ${match.group(2)}';
+      return raw;
+    }
+  }
+
+  String _resolveFileType(String? type, String? name, [String? filePath]) {
+    String fileType = type?.toUpperCase() ?? 'Inconnu';
+    if (fileType == 'VIDEO') fileType = 'VIDÉOS';
+
+    final source = (filePath?.trim().isNotEmpty == true ? filePath! : (name ?? '')).toLowerCase();
+    if (source.isNotEmpty) {
+      final extension = path.extension(source);
+      if (['.mp4'].contains(extension)) {
+        fileType = 'VIDÉOS';
+      } else if (extension == '.pdf') {
+        fileType = 'PDF';
+      } else if (['.png', '.jpg', '.jpeg'].contains(extension)) {
+        fileType = 'IMAGES';
+      } else if (extension == '.mp3') {
+        fileType = 'AUDIO';
+      }
+    }
+    return fileType;
+  }
+
+  bool _isTeacherResource(Map<String, dynamic> file) {
+    return file['isTeacherFile'] == true || file['category'] == 'Ressource enseignant';
+  }
+
+  String? _readFileIdentifier(Map<String, dynamic> file) {
+    if (_isTeacherResource(file)) {
+      final resourcePath = file['path']?.toString().trim();
+      if (resourcePath != null && resourcePath.isNotEmpty) {
+        return resourcePath;
+      }
+    }
+    final id = file['id']?.toString().trim();
+    return (id == null || id.isEmpty) ? null : id;
+  }
+
+  String _readFileRequestBody(Map<String, dynamic> file, {String? overrideId}) {
+    final identifier = overrideId ?? _readFileIdentifier(file);
+    final body = <String, dynamic>{'id': identifier};
+    if (_isTeacherResource(file) && file['sessionId'] != null) {
+      body['sessionId'] = file['sessionId'];
+    }
+    return json.encode(body);
+  }
+
+  bool _isVideoResource(Map<String, dynamic> file) {
+    const videoExtensions = ['.mp4'];
+    final title = (file['title'] ?? '').toString().toLowerCase();
+    final resourcePath = (file['path'] ?? '').toString().toLowerCase();
+    final type = (file['type'] ?? '').toString().toUpperCase();
+    return videoExtensions.any((ext) => title.endsWith(ext) || resourcePath.endsWith(ext)) ||
+        type == 'VIDÉOS' ||
+        type == 'VIDEO';
+  }
+
+  Future<void> _fetchResources() async {
+    final authProvider = Provider.of<AuthProvider>(context, listen: false);
+    final sessionId = _selectedSessionId();
+
+    try {
+      final uri = Uri.parse('$apiUrl/api/get-share-resource-folder').replace(
+        queryParameters: {
+          if (sessionId != null) 'sessionId': sessionId.toString(),
+        },
       );
 
-      print('API Response Status: ${foldersResponse.statusCode}');
-      print('API Response Body: ${foldersResponse.body}');
+      final foldersResponse = await authProvider.authenticatedRequest(
+        'GET',
+        uri.toString(),
+      );
 
       if (foldersResponse.statusCode == 200) {
         final foldersJson = jsonDecode(foldersResponse.body);
         final List<dynamic> folders = foldersJson['folders'] ?? [];
-
-        print('Folders found: ${folders.length}');
-        print('Folders data: $folders');
+        final List<dynamic> filesTeachers = foldersJson['filesTeachers'] ?? [];
 
         setState(() {
           final folderResources = folders.map((folder) {
-            final session = sessions.firstWhere(
-                  (s) => s['id'] == folder['sessionId'],
-              orElse: () => {'name': 'Session inconnue'},
-            );
+            final sessionIds = (folder['sessionIds'] as List<dynamic>?) ?? [];
             return {
               'id': folder['id'],
               'title': folder['name'] ?? 'Dossier sans nom',
@@ -559,19 +663,40 @@ class _ResourcesPageState extends State<ResourcesPage> with SingleTickerProvider
               'icon': Icons.folder,
               'color': const Color(0xFFFFCC80),
               'itemsCount': folder['itemsCount']?.toString() ?? '0',
-              'sessionId': folder['sessionId'],
-              'sessionName': session['name'],
+              'sessionIds': sessionIds,
+              'sessionId': sessionIds.isNotEmpty ? sessionIds.first : null,
+              'sessionName': _sessionNamesFromIds(sessionIds),
+              'generationId': folder['generationId'],
             };
           }).toList();
 
-          print('Processed folder resources: ${folderResources.length}');
+          final teacherFileResources = filesTeachers.map((file) {
+            final fileType = _resolveFileType(file['type'], file['name'], file['path']);
+            return {
+              'id': file['id'],
+              'title': file['name'] ?? 'Fichier sans nom',
+              'category': 'Ressource enseignant',
+              'size': null,
+              'type': fileType,
+              'time': _formatTeacherFileDate(file['createdAt']),
+              'icon': getIconForType(fileType),
+              'color': getColorForType(fileType),
+              'itemsCount': '1',
+              'sessionId': file['sessionId'],
+              'sessionIds': [if (file['sessionId'] != null) file['sessionId']],
+              'sessionName': file['sessionName'] ?? 'Session inconnue',
+              'accountName': file['accountName'],
+              'description': file['description'],
+              'path': file['path'],
+              'isTeacherFile': true,
+            };
+          }).toList();
 
-          allResources = folderResources;
+          allResources = [...folderResources, ...teacherFileResources];
           isConnectionError = false;
-          _hasLoadedData = true; // Marquer que les données ont été chargées
+          _hasLoadedData = true;
         });
       } else {
-        print('API Error: ${foldersResponse.statusCode} - ${foldersResponse.body}');
         if (mounted) {
           setState(() {
             isConnectionError = false;
@@ -579,7 +704,6 @@ class _ResourcesPageState extends State<ResourcesPage> with SingleTickerProvider
         }
       }
     } catch (e) {
-      print('Exception during fetchResources: $e');
       
       // Détecter les erreurs de connexion
       final isNetworkError = e is SocketException || 
@@ -610,7 +734,7 @@ class _ResourcesPageState extends State<ResourcesPage> with SingleTickerProvider
     final authProvider = Provider.of<AuthProvider>(context, listen: false);
     final loadingProvider = Provider.of<LoadingProvider>(context, listen: false);
 
-    if (file['id'] == null) {
+    if (_readFileIdentifier(file) == null) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text('Erreur : Données manquantes.')),
@@ -619,8 +743,7 @@ class _ResourcesPageState extends State<ResourcesPage> with SingleTickerProvider
       return;
     }
 
-    final videoExtensions = ['.mp4'];
-    bool isVideo = videoExtensions.any((ext) => file['title'].toLowerCase().endsWith(ext)) || file['type'].toUpperCase() == 'VIDÉOS';
+    final bool isVideo = _isVideoResource(file);
 
     try {
       loadingProvider.showLoading();
@@ -628,7 +751,7 @@ class _ResourcesPageState extends State<ResourcesPage> with SingleTickerProvider
         final response = await authProvider.authenticatedRequest(
           'POST',
           '/api/share-resource/read-file-video',
-          body: json.encode({'id': file['id'].toString().trim()}),
+          body: _readFileRequestBody(file),
         );
 
         if (response.statusCode == 200) {
@@ -710,17 +833,47 @@ class _ResourcesPageState extends State<ResourcesPage> with SingleTickerProvider
     }
   }
 
-  Future<void> _fetchFileFallback(Map<String, dynamic> file) async {
+  Future<void> _fetchFileFallback(Map<String, dynamic> file, {String? overrideId, bool allowTeacherFallback = true}) async {
     final authProvider = Provider.of<AuthProvider>(context, listen: false);
     final loadingProvider = Provider.of<LoadingProvider>(context, listen: false);
+
+    final identifier = overrideId ?? _readFileIdentifier(file);
+    if (identifier == null || identifier.isEmpty) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Erreur : Données manquantes.')),
+        );
+      }
+      return;
+    }
 
     try {
       loadingProvider.showLoading();
       final response = await authProvider.authenticatedRequest(
         'POST',
         '/api/share-resource/read-file',
-        body: json.encode({'id': file['id'].toString().trim()}),
+        body: _readFileRequestBody(file, overrideId: overrideId),
       );
+
+      if (response.statusCode != 200) {
+        if (allowTeacherFallback && _isTeacherResource(file) && overrideId == null) {
+          final numericId = file['id']?.toString().trim();
+          final pathId = file['path']?.toString().trim();
+          if (numericId != null &&
+              numericId.isNotEmpty &&
+              pathId != null &&
+              pathId.isNotEmpty &&
+              numericId != pathId) {
+            return _fetchFileFallback(file, overrideId: numericId, allowTeacherFallback: false);
+          }
+        }
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Erreur lors du téléchargement du fichier: ${response.statusCode} - ${response.body}')),
+          );
+        }
+        return;
+      }
 
       if (response.statusCode == 200) {
         final body = response.body.trim();
@@ -757,10 +910,14 @@ class _ResourcesPageState extends State<ResourcesPage> with SingleTickerProvider
         final imageExtensions = ['.png', '.jpg', '.jpeg'];
         final audioExtensions = ['.mp3'];
         final fileTitle = (file['title'] ?? '').toString().toLowerCase();
+        final resourcePath = (file['path'] ?? '').toString().toLowerCase();
         final fileType = (file['type'] ?? '').toString().toUpperCase();
-        final bool isVideo = videoExtensions.any((ext) => fileTitle.endsWith(ext)) || fileType == 'VIDÉOS' || fileType == 'VIDEO';
-        final bool isImage = imageExtensions.any((ext) => fileTitle.endsWith(ext)) || fileType == 'IMAGES' || fileType == 'IMAGE';
-        final bool isAudio = audioExtensions.any((ext) => fileTitle.endsWith(ext)) || fileType == 'AUDIO';
+        final bool isVideo = _isVideoResource(file) ||
+            videoExtensions.any((ext) => fileTitle.endsWith(ext) || resourcePath.endsWith(ext));
+        final bool isImage = imageExtensions.any((ext) => fileTitle.endsWith(ext) || resourcePath.endsWith(ext)) ||
+            fileType == 'IMAGES' || fileType == 'IMAGE';
+        final bool isAudio = audioExtensions.any((ext) => fileTitle.endsWith(ext) || resourcePath.endsWith(ext)) ||
+            fileType == 'AUDIO';
 
         if (fileContent['url'] != null && fileContent['url'].toString().isNotEmpty && isVideo) {
           final fileUrl = fileContent['url'].toString();
@@ -785,12 +942,25 @@ class _ResourcesPageState extends State<ResourcesPage> with SingleTickerProvider
           return;
         }
 
-        final bool isPdf = fileTitle.endsWith('.pdf') || fileType == 'PDF';
+        final bool isPdf = fileTitle.endsWith('.pdf') ||
+            resourcePath.endsWith('.pdf') ||
+            fileType == 'PDF';
         final String rawFileName = fileContent['fileName'] ?? file['title'].replaceAll(RegExp(r'[^\w\.]'), '_');
         final String fileName = _sanitizeFileName(path.basename(rawFileName));
         final String base64Content = fileContent['content']?.toString() ?? '';
 
         if (base64Content.isEmpty) {
+          if (allowTeacherFallback && _isTeacherResource(file) && overrideId == null) {
+            final numericId = file['id']?.toString().trim();
+            final pathId = file['path']?.toString().trim();
+            if (numericId != null &&
+                numericId.isNotEmpty &&
+                pathId != null &&
+                pathId.isNotEmpty &&
+                numericId != pathId) {
+              return _fetchFileFallback(file, overrideId: numericId, allowTeacherFallback: false);
+            }
+          }
           if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
               const SnackBar(content: Text('Le contenu du fichier est vide.')),
@@ -917,14 +1087,6 @@ class _ResourcesPageState extends State<ResourcesPage> with SingleTickerProvider
   List<Map<String, dynamic>> get filteredResources {
     List<Map<String, dynamic>> filtered = allResources;
 
-    if (selectedSession != 'Tous') {
-      final selectedSessionId = sessions.firstWhere(
-            (session) => session['name'] == selectedSession,
-        orElse: () => {'id': -1},
-      )['id'];
-      filtered = filtered.where((r) => r['sessionId'] == selectedSessionId).toList();
-    }
-
     if (_searchController.text.isNotEmpty) {
       final searchText = _searchController.text.toLowerCase();
       filtered = filtered.where((r) {
@@ -956,7 +1118,14 @@ class _ResourcesPageState extends State<ResourcesPage> with SingleTickerProvider
           body: Consumer<LoadingProvider>(
             builder: (context, loadingProvider, child) {
               if (loadingProvider.isLoading) {
-                return const SizedBox.shrink(); // No background content during loading
+                return Center(
+                  child: CircularProgressIndicator(color: theme.primaryColor),
+                );
+              }
+              if (isLoading && !_hasLoadedData) {
+                return Center(
+                  child: CircularProgressIndicator(color: theme.primaryColor),
+                );
               }
               if (isConnectionError) {
                 return Center(
@@ -1076,8 +1245,10 @@ class _ResourcesPageState extends State<ResourcesPage> with SingleTickerProvider
                   ),
                   const SizedBox(height: 12),
                   Expanded(
-                    child: !_hasLoadedData
-                        ? const SizedBox.shrink() // Ne rien afficher tant que les données ne sont pas chargées
+                    child: isLoading || !_hasLoadedData
+                        ? Center(
+                            child: CircularProgressIndicator(color: theme.primaryColor),
+                          )
                         : filteredResources.isEmpty
                             ? Center(
                                 child: Column(
@@ -1248,7 +1419,7 @@ class _ResourcesPageState extends State<ResourcesPage> with SingleTickerProvider
                           borderRadius: BorderRadius.circular(8),
                         ),
                         child: Text(
-                          resource['type'],
+                          resource['category'] ?? resource['type'],
                           style: TextStyle(
                             color: resource['color'],
                             fontSize: 12,
@@ -1257,14 +1428,15 @@ class _ResourcesPageState extends State<ResourcesPage> with SingleTickerProvider
                         ),
                       ),
                       const SizedBox(width: 8),
-                      Text(
-                        '${resource['itemsCount']} élément${resource['itemsCount'] != '1' ? 's' : ''}',
-                        style: TextStyle(
-                          color: theme.textTheme.bodyMedium?.color ?? Colors.grey[600],
-                          fontSize: 12,
-                          fontWeight: FontWeight.w500,
+                      if (resource['type'] == 'Dossiers')
+                        Text(
+                          '${resource['itemsCount']} élément${resource['itemsCount'] != '1' ? 's' : ''}',
+                          style: TextStyle(
+                            color: theme.textTheme.bodyMedium?.color ?? Colors.grey[600],
+                            fontSize: 12,
+                            fontWeight: FontWeight.w500,
+                          ),
                         ),
-                      ),
                     ],
                   ),
                   const SizedBox(height: 6),
@@ -1313,6 +1485,25 @@ class _ResourcesPageState extends State<ResourcesPage> with SingleTickerProvider
                     ],
                   ),
                   const SizedBox(height: 4),
+                  if (resource['accountName'] != null)
+                    Row(
+                      children: [
+                        Icon(Icons.person, size: 14, color: theme.iconTheme.color?.withOpacity(0.5)),
+                        const SizedBox(width: 4),
+                        Expanded(
+                          child: Text(
+                            resource['accountName'],
+                            style: TextStyle(
+                              color: theme.textTheme.bodyMedium?.color ?? Colors.grey[600],
+                              fontSize: 12,
+                              fontWeight: FontWeight.w500,
+                            ),
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                      ],
+                    ),
+                  if (resource['accountName'] != null) const SizedBox(height: 4),
                   Row(
                     children: [
                       Icon(Icons.school, size: 14, color: theme.iconTheme.color?.withOpacity(0.5)),
@@ -1473,8 +1664,8 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
           decoration: BoxDecoration(
             gradient: LinearGradient(
               colors: isDark
-                  ? const [Color(0xFF1A003D), Color(0xFF3C0D73)] // Dark mode gradient
-                  : const [Color(0xFF8E2DE2), Color(0xFF4A00E0)], // Light mode gradient
+                  ? const [Color(0xFF1A003D), Color(0xFF3C0D73)]
+                  : const [Color(0xFF8E2DE2), Color(0xFF4A00E0)],
               begin: Alignment.topLeft,
               end: Alignment.bottomRight,
             ),
@@ -2013,8 +2204,8 @@ class _FolderDetailsPageState extends State<FolderDetailsPage> {
             decoration: BoxDecoration(
               gradient: LinearGradient(
                 colors: theme.brightness == Brightness.dark
-                    ? const [Color(0xFF1A003D), Color(0xFF3C0D73)] // Dark mode gradient
-                    : const [Color(0xFF8E2DE2), Color(0xFF4A00E0)], // Light mode gradient
+                    ? const [Color(0xFF1A003D), Color(0xFF3C0D73)]
+                    : const [Color(0xFF8E2DE2), Color(0xFF4A00E0)],
                 begin: Alignment.topLeft,
                 end: Alignment.bottomRight,
               ),
@@ -2024,7 +2215,9 @@ class _FolderDetailsPageState extends State<FolderDetailsPage> {
         body: Consumer<LoadingProvider>(
           builder: (context, loadingProvider, child) {
             if (loadingProvider.isLoading) {
-              return const SizedBox.shrink(); // No background content during loading
+              return Center(
+                child: CircularProgressIndicator(color: theme.colorScheme.primary),
+              );
             }
             return Padding(
               padding: const EdgeInsets.all(16.0),

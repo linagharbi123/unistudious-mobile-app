@@ -2,11 +2,11 @@ buildscript {
     ext {
         kotlin_version = '2.1.0'
 
-        // 🔥 IMPORTANT POUR GOOGLE PLAY (16 KB FIX)
-        compileSdkVersion = 35
-        targetSdkVersion = 35
+        // Google Play: target API 36 (Android 16) required for updates from Aug 31, 2026
+        compileSdkVersion = 36
+        targetSdkVersion = 36
         minSdkVersion = 26
-        ndkVersion = "26.1.10909125"
+        ndkVersion = "28.2.13676358"
     }
 
     repositories {

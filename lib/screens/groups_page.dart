@@ -1,11 +1,14 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:provider/provider.dart';
 import '../providers/auth_provider.dart';
 import '../providers/loading_provider.dart';
 import '../providers/theme_provider.dart';
+import '../models/app_bar_provider.dart';
 import '../widgets/loading_wrapper.dart';
 import '../utils/snackbar_helper.dart';
+import '../services/page_cache_service.dart';
 import 'dart:convert';
 import 'package:intl/intl.dart';
 import 'package:intl/date_symbol_data_local.dart';
@@ -14,6 +17,20 @@ import 'package:table_calendar/table_calendar.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'dart:developer' as developer;
+
+/// Log uniquement en mode debug pour éviter le coût en production
+void _debugLog(String msg, {String name = 'GroupsPage', Object? error, StackTrace? stackTrace}) {
+  if (kDebugMode) developer.log(msg, name: name, error: error, stackTrace: stackTrace);
+}
+
+/// Parse une valeur API en booléen (supporte true, "true", 1, etc.)
+bool _parseBool(dynamic v) {
+  if (v == null) return false;
+  if (v is bool) return v;
+  if (v is int) return v != 0;
+  if (v is String) return v.toLowerCase() == 'true' || v == '1';
+  return false;
+}
 
 class GroupsPage extends StatefulWidget {
   const GroupsPage({super.key});
@@ -51,18 +68,143 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
   final Map<int, bool> _isLoadingCalendar = {}; // sessionId -> isLoading
   final Map<int, Set<String>> _loadedMonths = {}; // sessionId -> loadedMonths
 
+  int _lastAppBarSessionsLength = -1;
+  bool _lastAppBarLoading = true;
+  final Map<int, DateTime> _lastLoadMoreTrigger = {};
+  static const _loadMoreDebounceMs = 800;
+
+  /// Flags pending lus une fois (évite FutureBuilder = lag / flash des boutons)
+  final Map<String, bool> _pendingChangeFlags = {};
+  final Map<String, bool> _pendingJoinFlags = {};
+  final Set<int> _calendarFetchScheduled = {};
+  bool _hasDisplayedContent = false;
+
+  String _pendingKey(dynamic sessionId, dynamic groupId) =>
+      '${sessionId}_$groupId';
+
   @override
   void initState() {
     super.initState();
     initializeDateFormatting('fr_FR', null);
     _tabController = TabController(length: 1, vsync: this);
     WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _updateAppBarConfigIfNeeded();
       _checkAuthAndFetchData();
     });
   }
 
+  Future<void> _hydratePendingFlags(List<Map<String, dynamic>> groupList) async {
+    final prefs = await SharedPreferences.getInstance();
+    for (final g in groupList) {
+      final sid = g['sessionId'];
+      final gid = g['groupId'];
+      if (sid == null || gid == null) continue;
+      final key = _pendingKey(sid, gid);
+      _pendingChangeFlags[key] = prefs.getBool('pending_change_${sid}_$gid') ?? false;
+      _pendingJoinFlags[key] = prefs.getBool('pending_join_${sid}_$gid') ?? false;
+    }
+  }
+
+  /// Sync prefs hors du chemin critique d'affichage.
+  Future<void> _syncPendingPrefsWithApi(
+    List<Map<String, dynamic>> groupList,
+    AuthProvider authProvider,
+  ) async {
+    for (final group in groupList) {
+      final rawSessionId = group['sessionId'];
+      final rawGroupId = group['groupId'];
+      if (rawSessionId == null || rawGroupId == null) continue;
+      final currentSessionId =
+          rawSessionId is int ? rawSessionId : int.tryParse(rawSessionId.toString());
+      final currentGroupId =
+          rawGroupId is int ? rawGroupId : int.tryParse(rawGroupId.toString());
+      if (currentSessionId == null || currentGroupId == null) continue;
+
+      final bool isJoined = group['joined'] == true;
+      final bool isPendingFromApi = group['pendingJoin'] == true;
+      final bool apiHasChangeRequest = _parseBool(group['hasChangeRequest']);
+      final bool apiHasJoinRequest = _parseBool(group['hasJoinRequest']);
+
+      if (isJoined) {
+        await authProvider.removePendingChange(currentSessionId, currentGroupId);
+        await authProvider.removePendingJoin(currentSessionId, currentGroupId);
+        _pendingChangeFlags[_pendingKey(currentSessionId, currentGroupId)] = false;
+        _pendingJoinFlags[_pendingKey(currentSessionId, currentGroupId)] = false;
+      } else if (apiHasChangeRequest) {
+        await authProvider.setPendingChange(currentSessionId, currentGroupId, true);
+        await authProvider.removePendingJoin(currentSessionId, currentGroupId);
+        _pendingChangeFlags[_pendingKey(currentSessionId, currentGroupId)] = true;
+        _pendingJoinFlags[_pendingKey(currentSessionId, currentGroupId)] = false;
+      } else if (apiHasJoinRequest || isPendingFromApi) {
+        await authProvider.removePendingChange(currentSessionId, currentGroupId);
+        await authProvider.setPendingJoin(currentSessionId, currentGroupId, true);
+        _pendingChangeFlags[_pendingKey(currentSessionId, currentGroupId)] = false;
+        _pendingJoinFlags[_pendingKey(currentSessionId, currentGroupId)] = true;
+      } else {
+        await authProvider.removePendingChange(currentSessionId, currentGroupId);
+        await authProvider.removePendingJoin(currentSessionId, currentGroupId);
+        _pendingChangeFlags[_pendingKey(currentSessionId, currentGroupId)] = false;
+        _pendingJoinFlags[_pendingKey(currentSessionId, currentGroupId)] = false;
+      }
+    }
+  }
+
+  void _scheduleCalendarFetch(int sessionId, {bool isPriority = false}) {
+    if (_calendarFetchScheduled.contains(sessionId)) return;
+    _calendarFetchScheduled.add(sessionId);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _fetchSessionCalendarEvents(sessionId, isPriority: isPriority);
+      Future.delayed(const Duration(milliseconds: 300), () {
+        if (mounted) _loadOtherMonthsInBackground(sessionId);
+      });
+    });
+  }
+
+  void _updateAppBarConfigIfNeeded() {
+    if (!mounted) return;
+    if (_lastAppBarSessionsLength == sessions.length && _lastAppBarLoading == isLoading) return;
+    _lastAppBarSessionsLength = sessions.length;
+    _lastAppBarLoading = isLoading;
+
+    final appBarProvider = Provider.of<AppBarProvider>(context, listen: false);
+    // Ne plus mettre le TabBar dans l'AppBar (partagée) pour éviter "TabController used after disposed".
+    // Le TabBar est maintenant dans le body de GroupsPage, même cycle de vie que le TabController.
+    appBarProvider.updateConfig(1, AppBarConfig(
+      title: sessions.isNotEmpty ? 'Groupes de révision' : 'Groupes',
+      bottom: null,
+    ));
+  }
+
+  int get _tabCount => sessions.isNotEmpty ? sessions.length : 1;
+
+  bool get _isTabControllerSynced =>
+      _tabController != null && _tabController!.length == _tabCount;
+
+  /// Recrée le TabController quand le nombre de sessions change (cache ou API).
+  void _syncTabControllerWithSessions() {
+    final newLength = _tabCount;
+    if (_tabController != null && _tabController!.length == newLength) return;
+
+    final oldController = _tabController;
+    _tabController = TabController(length: newLength, vsync: this);
+
+    if (oldController != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        oldController.dispose();
+      });
+    }
+  }
+
   @override
   void dispose() {
+    // Retirer le TabBar de l'AppBar avant de disposer le controller pour éviter
+    // "TabController used after being disposed" si l'utilisateur tape pendant la fermeture.
+    try {
+      final appBarProvider = Provider.of<AppBarProvider>(context, listen: false);
+      appBarProvider.updateConfig(1, AppBarConfig(title: 'Groupes', bottom: null));
+    } catch (_) {}
     _tabController?.dispose();
     _reasonController.dispose();
     // Nettoyer les ScrollControllers
@@ -73,9 +215,38 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
     super.dispose();
   }
 
+  Future<void> _loadFromCache() async {
+    final authProvider = Provider.of<AuthProvider>(context, listen: false);
+    final cached = await PageCacheService.load(
+      'groups',
+      userToken: authProvider.currentToken,
+    );
+    if (cached == null || !mounted) return;
+
+    final cachedSessions = (cached['sessions'] as List?)
+            ?.map((s) => Map<String, dynamic>.from(s as Map))
+            .toList() ??
+        [];
+    final cachedGroups = (cached['groups'] as List?)
+            ?.map((g) => Map<String, dynamic>.from(g as Map))
+            .toList() ??
+        [];
+    if (cachedSessions.isEmpty && cachedGroups.isEmpty) return;
+
+    await _hydratePendingFlags(cachedGroups);
+    if (!mounted) return;
+
+    setState(() {
+      sessions = cachedSessions;
+      groups = cachedGroups;
+      isLoading = false;
+      _hasDisplayedContent = true;
+      _syncTabControllerWithSessions();
+    });
+  }
+
   Future<void> _checkAuthAndFetchData() async {
     final authProvider = Provider.of<AuthProvider>(context, listen: false);
-    final loadingProvider = Provider.of<LoadingProvider>(context, listen: false);
 
     if (!authProvider.isLoggedIn) {
       if (mounted) {
@@ -85,96 +256,97 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
       return;
     }
 
-    loadingProvider.showLoading();
+    await _loadFromCache();
+    // Ne pas remettre le loader si le cache a déjà affiché du contenu
+    if (mounted && !_hasDisplayedContent) {
+      setState(() => isLoading = true);
+    }
 
     try {
       await fetchSessions();
       
-      // Charger les groupes pour toutes les sessions en parallèle (sans calendriers pour être rapide)
       if (sessions.isNotEmpty) {
-        final futures = sessions.map((session) async {
-          final sessionId = session['id'];
-          _currentPage[sessionId] = 1;
-          _hasMorePages[sessionId] = true;
-          // Charger les groupes sans calendriers pour être rapide
-          await fetchGroups(sessionId: sessionId, page: 1, perPage: 8, append: false, skipCalendar: true);
-        }).toList();
-        
-        // Attendre que tous les groupes soient chargés en parallèle
-        await Future.wait(futures);
-        
-        // Masquer le loading après que le frame soit rendu pour s'assurer que les groupes sont affichés
-        if (mounted) {
-          SchedulerBinding.instance.addPostFrameCallback((_) {
-            if (mounted) {
-              loadingProvider.hideLoading();
-            }
-          });
-        }
-        
-        // Charger les calendriers en arrière-plan après l'affichage
-        Future.microtask(() async {
-          for (var session in sessions) {
-            final sessionId = session['id'];
-            await _loadCalendarForGroups(sessionId);
-          }
-        });
-      }
-      
-      await fetchCurrentGroupForSessions();
-      
-      // Charger immédiatement le calendrier de la première session avec startDate et endDate
-      if (sessions.isNotEmpty) {
+        // Afficher rapidement la première session, charger le reste en arrière-plan
         final firstSessionId = sessions.first['id'];
-        // Initialiser les structures pour la première session
-        if (!_focusedDays.containsKey(firstSessionId)) {
-          _focusedDays[firstSessionId] = DateTime.now();
-          _selectedDays[firstSessionId] = null;
-          _sessionEvents[firstSessionId] = {};
-          _isLoadingCalendar[firstSessionId] = false;
-          _loadedMonths[firstSessionId] = {};
+        _currentPage[firstSessionId] = 1;
+        _hasMorePages[firstSessionId] = true;
+        await fetchGroups(sessionId: firstSessionId, page: 1, perPage: 8, append: false, skipCalendar: true);
+
+        if (mounted) {
+          setState(() {
+            isLoading = false;
+            _hasDisplayedContent = true;
+          });
+          _updateAppBarConfigIfNeeded();
         }
-        // Charger le mois actuel immédiatement
-        _fetchSessionCalendarEvents(firstSessionId, isPriority: true);
-        // Charger les autres mois en arrière-plan
-        Future.delayed(const Duration(milliseconds: 500), () {
-          if (mounted) {
-            _loadOtherMonthsInBackground(firstSessionId);
-          }
-        });
-        // Charger les autres sessions en arrière-plan
-        Future.delayed(const Duration(milliseconds: 800), () {
-          if (mounted && sessions.length > 1) {
-            for (int i = 1; i < sessions.length; i++) {
-              final sessionId = sessions[i]['id'];
-              if (!_focusedDays.containsKey(sessionId)) {
-                _focusedDays[sessionId] = DateTime.now();
-                _selectedDays[sessionId] = null;
-                _sessionEvents[sessionId] = {};
-                _isLoadingCalendar[sessionId] = false;
-                _loadedMonths[sessionId] = {};
-              }
-              _fetchSessionCalendarEvents(sessionId, isPriority: false);
-              Future.delayed(Duration(milliseconds: 200 * i), () {
-                if (mounted) {
-                  _loadOtherMonthsInBackground(sessionId);
-                }
-              });
-            }
-          }
-        });
+
+        await _saveToCache();
+        _loadRemainingSessionsInBackground();
       }
     } catch (e) {
-      developer.log('🔴 Erreur dans _checkAuthAndFetchData: $e', name: 'GroupsPage', error: e);
+      _debugLog('🔴 Erreur dans _checkAuthAndFetchData: $e', name: 'GroupsPage', error: e);
       setState(() {
         errorMessage = 'Erreur lors du chargement: $e';
       });
     } finally {
-      loadingProvider.hideLoading();
-      setState(() {
-        isLoading = false;
-      });
+      if (mounted && isLoading) {
+        setState(() => isLoading = false);
+      }
+      if (mounted) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) _updateAppBarConfigIfNeeded();
+        });
+      }
     }
+  }
+
+  Future<void> _saveToCache() async {
+    final authProvider = Provider.of<AuthProvider>(context, listen: false);
+    await PageCacheService.save(
+      'groups',
+      {
+        'sessions': sessions,
+        'groups': groups,
+      },
+      userToken: authProvider.currentToken,
+    );
+  }
+
+  Future<void> _loadRemainingSessionsInBackground() async {
+    if (sessions.length > 1) {
+      final futures = sessions.skip(1).map((session) async {
+        final sessionId = session['id'];
+        _currentPage[sessionId] = 1;
+        _hasMorePages[sessionId] = true;
+        await fetchGroups(sessionId: sessionId, page: 1, perPage: 8, append: false, skipCalendar: true);
+      });
+      await Future.wait(futures);
+      if (mounted) {
+        setState(() {});
+        await _saveToCache();
+      }
+    }
+
+    await fetchCurrentGroupForSessions();
+
+    for (var session in sessions) {
+      final sessionId = session['id'];
+      if (!_focusedDays.containsKey(sessionId)) {
+        _focusedDays[sessionId] = DateTime.now();
+        _selectedDays[sessionId] = null;
+        _sessionEvents[sessionId] = {};
+        _isLoadingCalendar[sessionId] = false;
+        _loadedMonths[sessionId] = {};
+      }
+      _fetchSessionCalendarEvents(sessionId, isPriority: sessionId == sessions.first['id']);
+      if (mounted) _loadOtherMonthsInBackground(sessionId);
+    }
+
+    Future.microtask(() async {
+      for (var session in sessions) {
+        await _loadCalendarForGroups(session['id']);
+      }
+    });
   }
 
   Future<void> refreshData() async {
@@ -222,6 +394,11 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
       setState(() {
         isLoading = false;
       });
+      if (mounted) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) _updateAppBarConfigIfNeeded();
+        });
+      }
     }
   }
 
@@ -239,6 +416,7 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
         if (data is! List) {
           throw const FormatException('Expected a list of sessions');
         }
+        TabController? oldController;
         setState(() {
           sessions = data
               .where((item) => item['id'] != null && item['name'] != null)
@@ -247,12 +425,28 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
             'name': item['name'] as String,
           })
               .toList();
-          _tabController?.dispose();
-          _tabController = TabController(
-            length: sessions.isNotEmpty ? sessions.length : 1,
-            vsync: this,
-          );
+          oldController = _tabController;
+          _syncTabControllerWithSessions();
         });
+        if (mounted) {
+          final appBarProvider = Provider.of<AppBarProvider>(context, listen: false);
+          appBarProvider.updateConfig(1, AppBarConfig(
+            title: sessions.isNotEmpty ? 'Groupes de révision' : 'Groupes',
+            bottom: null,
+          ));
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              if (oldController != _tabController) {
+                oldController?.dispose();
+              }
+              if (mounted) _updateAppBarConfigIfNeeded();
+            });
+          });
+        } else {
+          if (oldController != _tabController) {
+            oldController?.dispose();
+          }
+        }
       } else if (response.statusCode == 401 || response.statusCode == 403) {
         if (mounted) {
           SnackBarHelper.showError(context, 'Session expirée. Veuillez vous reconnecter.');
@@ -282,7 +476,7 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
       final sessionGroups = groups.where((g) => g['sessionId'] == sessionId).toList();
       if (sessionGroups.isEmpty) return;
       
-      developer.log('📅 Chargement du calendrier pour sessionId: $sessionId', name: 'GroupsPage');
+      _debugLog('📅 Chargement du calendrier pour sessionId: $sessionId', name: 'GroupsPage');
       
       final calendarEndpoint = '/api/get-calander-group-management/$sessionId';
       final calendarResponse = await authProvider
@@ -307,15 +501,15 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
           }
         });
         
-        developer.log('📅 ✅ Calendrier chargé pour sessionId: $sessionId', name: 'GroupsPage');
+        _debugLog('📅 ✅ Calendrier chargé pour sessionId: $sessionId', name: 'GroupsPage');
       }
     } catch (e) {
-      developer.log('🔴 Erreur lors du chargement du calendrier pour sessionId $sessionId: $e', name: 'GroupsPage');
+      _debugLog('🔴 Erreur lors du chargement du calendrier pour sessionId $sessionId: $e', name: 'GroupsPage');
     }
   }
 
   Future<void> fetchGroups({int? sessionId, int page = 1, int perPage = 8, bool append = false, bool skipCalendar = false}) async {
-    developer.log('🔵 fetchGroups appelé - sessionId: $sessionId, page: $page, perPage: $perPage, append: $append', name: 'GroupsPage');
+    _debugLog('🔵 fetchGroups appelé - sessionId: $sessionId, page: $page, perPage: $perPage, append: $append', name: 'GroupsPage');
     final authProvider = Provider.of<AuthProvider>(context, listen: false);
     const String groupsEndpoint = '/api/get-group-management';
 
@@ -329,19 +523,19 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
         },
       );
 
-      developer.log('🔵 URI construite: ${uri.toString()}', name: 'GroupsPage');
-      developer.log('🔵 Envoi de la requête API...', name: 'GroupsPage');
+      _debugLog('🔵 URI construite: ${uri.toString()}', name: 'GroupsPage');
+      _debugLog('🔵 Envoi de la requête API...', name: 'GroupsPage');
 
       final groupsResponse = await authProvider
           .authenticatedRequest('GET', uri.toString());
 
-      developer.log('🔵 Réponse reçue - Status: ${groupsResponse.statusCode}', name: 'GroupsPage');
+      _debugLog('🔵 Réponse reçue - Status: ${groupsResponse.statusCode}', name: 'GroupsPage');
 
       if (groupsResponse.statusCode == 200) {
         final Map<String, dynamic> groupsData = jsonDecode(groupsResponse.body);
         final List<dynamic> rawGroups = groupsData['groups'] ?? [];
         
-        developer.log('🔵 Nombre de groupes reçus: ${rawGroups.length}', name: 'GroupsPage');
+        _debugLog('🔵 Nombre de groupes reçus: ${rawGroups.length}', name: 'GroupsPage');
         
         // Gérer la pagination
         if (groupsData['pagination'] != null) {
@@ -349,14 +543,14 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
           final currentPageNum = paginationData['currentPage'] as int? ?? page;
           final totalPages = paginationData['totalPages'] as int? ?? 1;
           
-          developer.log('🔵 Pagination - currentPage: $currentPageNum, totalPages: $totalPages', name: 'GroupsPage');
+          _debugLog('🔵 Pagination - currentPage: $currentPageNum, totalPages: $totalPages', name: 'GroupsPage');
           
           if (sessionId != null) {
             setState(() {
               _currentPage[sessionId] = currentPageNum;
               _hasMorePages[sessionId] = currentPageNum < totalPages;
             });
-            developer.log('🔵 État pagination mis à jour pour sessionId $sessionId - hasMorePages: ${_hasMorePages[sessionId]}', name: 'GroupsPage');
+            _debugLog('🔵 État pagination mis à jour pour sessionId $sessionId - hasMorePages: ${_hasMorePages[sessionId]}', name: 'GroupsPage');
           }
           
           setState(() {
@@ -381,25 +575,52 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
           } catch (e) {
             capacity = 0;
           }
+          final gid = group['groupId'];
+          final sid = group['sessionId'];
+          Map<String, dynamic>? existing;
+          try {
+            existing = groups.firstWhere(
+              (g) => g['groupId'] == gid && g['sessionId'] == sid,
+            );
+          } catch (_) {
+            existing = null;
+          }
           return {
-            'groupId': group['groupId'],
+            'groupId': gid,
             'name': group['groupName'] ?? 'Groupe sans nom',
             'capacity': capacity,
             'members': group['userCount'] ?? 0,
             'joined': group['isUserInGroup'] ?? false,
             'pendingJoin': group['pendingJoin'] ?? false,
+            'requestRejected': group['requestRejected'] ?? false,
             'hasEmptyRelation': group['hasEmptyRelation'] ?? false,
             'userOneRelation': group['userOneRelation'] ?? false,
             'specialGroupStatus': group['specialGroupStatus'] ?? false,
-            'sessionId': group['sessionId'],
-            'teacher': 'Unknown',
-            'subject': 'Unknown',
+            'hasChangeRequest': _parseBool(group['hasChangeRequest'] ?? group['haschangeRequest'] ?? group['has_change_request']),
+            'hasJoinRequest': _parseBool(group['hasJoinRequest'] ?? group['hasjoinrequest'] ?? group['has_join_request']),
+            'sessionId': sid,
+            'teacher': existing?['teacher'] ?? 'Unknown',
+            'subject': existing?['subject'] ?? 'Unknown',
             'type': group['type'] ?? 'Normal',
           };
         }).toList();
 
-        developer.log('🔵 Groupes transformés: ${tempGroups.length} groupes', name: 'GroupsPage');
-        developer.log('🔵 Groupes pour sessionId $sessionId: ${tempGroups.where((g) => g['sessionId'] == sessionId).length}', name: 'GroupsPage');
+        _debugLog('🔵 Groupes transformés: ${tempGroups.length} groupes', name: 'GroupsPage');
+        _debugLog('🔵 Groupes pour sessionId $sessionId: ${tempGroups.where((g) => g['sessionId'] == sessionId).length}', name: 'GroupsPage');
+        // Debug: log les groupes avec hasChangeRequest ou hasJoinRequest
+        final withChange = tempGroups.where((g) => _parseBool(g['hasChangeRequest'])).toList();
+        final withJoin = tempGroups.where((g) => _parseBool(g['hasJoinRequest'])).toList();
+        if (rawGroups.isNotEmpty) {
+          _debugLog('🔵 Premier groupe API keys: ${(rawGroups.first as Map).keys.toList()}', name: 'GroupsPage');
+          if (withChange.isNotEmpty || withJoin.isNotEmpty) {
+            _debugLog('🔵 hasChangeRequest: ${withChange.length} groupes, hasJoinRequest: ${withJoin.length} groupes', name: 'GroupsPage');
+          }
+        }
+
+        // Hydrater les flags avant affichage, sync prefs en arrière-plan (pas de lag UI)
+        await _hydratePendingFlags(tempGroups);
+        // ignore: unawaited_futures
+        _syncPendingPrefsWithApi(tempGroups, authProvider);
 
         // Charger les calendriers seulement si skipCalendar est false
         if (!skipCalendar) {
@@ -433,7 +654,15 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
                       group['subject'] = event['subjectName'] ?? 'Unknown';
                     }
 
-                    if (group['joined'] || !group['pendingJoin']) {
+                    final bool gJoined = group['joined'] == true;
+                    final bool gPending = group['pendingJoin'] == true;
+                    if (gJoined) {
+                      await authProvider.removePendingChange(currentSessionId, group['groupId']);
+                      await authProvider.removePendingJoin(currentSessionId, group['groupId']);
+                    } else if (gPending) {
+                      await authProvider.setPendingJoin(currentSessionId, group['groupId'], true);
+                    } else {
+                      // joined=false ET pendingJoin=false = admin a rejeté → effacer pour réafficher les boutons
                       await authProvider.removePendingChange(currentSessionId, group['groupId']);
                       await authProvider.removePendingJoin(currentSessionId, group['groupId']);
                     }
@@ -447,8 +676,8 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
           }
         }
 
-        developer.log('🔵 Avant setState - Nombre total de groupes actuels: ${groups.length}', name: 'GroupsPage');
-        developer.log('🔵 append: $append, sessionId: $sessionId', name: 'GroupsPage');
+        _debugLog('🔵 Avant setState - Nombre total de groupes actuels: ${groups.length}', name: 'GroupsPage');
+        _debugLog('🔵 append: $append, sessionId: $sessionId', name: 'GroupsPage');
         
         setState(() {
           if (append && sessionId != null) {
@@ -459,43 +688,43 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
             final existingSessionGroups = groups.where((g) => g['sessionId'] == sessionId).toList();
             // Ajouter les nouveaux groupes de cette session
             final newGroupsForSession = tempGroups.where((g) => g['sessionId'] == sessionId).toList();
-            developer.log('🔵 Mode APPEND - otherSessionsGroups: ${otherSessionsGroups.length}, existingSessionGroups: ${existingSessionGroups.length}, newGroupsForSession: ${newGroupsForSession.length}', name: 'GroupsPage');
+            _debugLog('🔵 Mode APPEND - otherSessionsGroups: ${otherSessionsGroups.length}, existingSessionGroups: ${existingSessionGroups.length}, newGroupsForSession: ${newGroupsForSession.length}', name: 'GroupsPage');
             // Combiner : autres sessions + groupes existants de cette session + nouveaux groupes de cette session
             groups = [...otherSessionsGroups, ...existingSessionGroups, ...newGroupsForSession];
-            developer.log('🔵 Après APPEND - Nombre total de groupes: ${groups.length}', name: 'GroupsPage');
-            developer.log('🔵 Groupes pour sessionId $sessionId: ${groups.where((g) => g['sessionId'] == sessionId).length}', name: 'GroupsPage');
+            _debugLog('🔵 Après APPEND - Nombre total de groupes: ${groups.length}', name: 'GroupsPage');
+            _debugLog('🔵 Groupes pour sessionId $sessionId: ${groups.where((g) => g['sessionId'] == sessionId).length}', name: 'GroupsPage');
           } else {
             // Remplacer tous les groupes ou seulement ceux de la session spécifiée
             if (sessionId != null) {
               final otherSessionsGroups = groups.where((g) => g['sessionId'] != sessionId).toList();
               final thisSessionGroups = tempGroups.where((g) => g['sessionId'] == sessionId).toList();
-              developer.log('🔵 Mode REPLACE pour sessionId $sessionId - otherSessionsGroups: ${otherSessionsGroups.length}, thisSessionGroups: ${thisSessionGroups.length}', name: 'GroupsPage');
+              _debugLog('🔵 Mode REPLACE pour sessionId $sessionId - otherSessionsGroups: ${otherSessionsGroups.length}, thisSessionGroups: ${thisSessionGroups.length}', name: 'GroupsPage');
               groups = [...otherSessionsGroups, ...thisSessionGroups];
             } else {
-              developer.log('🔵 Mode REPLACE tous les groupes - tempGroups: ${tempGroups.length}', name: 'GroupsPage');
+              _debugLog('🔵 Mode REPLACE tous les groupes - tempGroups: ${tempGroups.length}', name: 'GroupsPage');
               groups = tempGroups;
             }
-            developer.log('🔵 Après REPLACE - Nombre total de groupes: ${groups.length}', name: 'GroupsPage');
+            _debugLog('🔵 Après REPLACE - Nombre total de groupes: ${groups.length}', name: 'GroupsPage');
           }
         });
         
-        developer.log('🔵 ✅ setState terminé - Nombre final de groupes: ${groups.length}', name: 'GroupsPage');
+        _debugLog('🔵 ✅ setState terminé - Nombre final de groupes: ${groups.length}', name: 'GroupsPage');
       } else if (groupsResponse.statusCode == 401 || groupsResponse.statusCode == 403) {
-        developer.log('🔴 Erreur d\'authentification: ${groupsResponse.statusCode}', name: 'GroupsPage');
+        _debugLog('🔴 Erreur d\'authentification: ${groupsResponse.statusCode}', name: 'GroupsPage');
         if (mounted) {
           SnackBarHelper.showError(context, 'Session expirée. Veuillez vous reconnecter.');
           Navigator.pushReplacementNamed(context, '/login');
         }
         await authProvider.logout();
       } else {
-        developer.log('🔴 Erreur HTTP: ${groupsResponse.statusCode}', name: 'GroupsPage');
-        developer.log('🔴 Body de la réponse: ${groupsResponse.body}', name: 'GroupsPage');
+        _debugLog('🔴 Erreur HTTP: ${groupsResponse.statusCode}', name: 'GroupsPage');
+        _debugLog('🔴 Body de la réponse: ${groupsResponse.body}', name: 'GroupsPage');
         setState(() {
           errorMessage = 'Échec du chargement des groupes : ${groupsResponse.statusCode}';
         });
       }
     } catch (e, stackTrace) {
-      developer.log('🔴 Exception dans fetchGroups: $e', name: 'GroupsPage', error: e, stackTrace: stackTrace);
+      _debugLog('🔴 Exception dans fetchGroups: $e', name: 'GroupsPage', error: e, stackTrace: stackTrace);
       setState(() {
         errorMessage = 'Erreur lors de la récupération des groupes : $e';
       });
@@ -503,43 +732,45 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
   }
 
   Future<void> loadMoreGroups(int sessionId, {int perPage = 8}) async {
-    developer.log('🟢 loadMoreGroups appelé pour sessionId: $sessionId', name: 'GroupsPage');
-    developer.log('🟢 _isLoadingMore[$sessionId]: ${_isLoadingMore[sessionId]}', name: 'GroupsPage');
-    developer.log('🟢 _hasMorePages[$sessionId]: ${_hasMorePages[sessionId]}', name: 'GroupsPage');
+    _debugLog('🟢 loadMoreGroups appelé pour sessionId: $sessionId', name: 'GroupsPage');
+    _debugLog('🟢 _isLoadingMore[$sessionId]: ${_isLoadingMore[sessionId]}', name: 'GroupsPage');
+    _debugLog('🟢 _hasMorePages[$sessionId]: ${_hasMorePages[sessionId]}', name: 'GroupsPage');
     
     if (_isLoadingMore[sessionId] == true || _hasMorePages[sessionId] == false) {
-      developer.log('🟡 loadMoreGroups annulé - isLoadingMore: ${_isLoadingMore[sessionId]}, hasMorePages: ${_hasMorePages[sessionId]}', name: 'GroupsPage');
+      _debugLog('🟡 loadMoreGroups annulé - isLoadingMore: ${_isLoadingMore[sessionId]}, hasMorePages: ${_hasMorePages[sessionId]}', name: 'GroupsPage');
       return;
     }
 
-    developer.log('🟢 Démarrage du chargement de plus de groupes...', name: 'GroupsPage');
+    _debugLog('🟢 Démarrage du chargement de plus de groupes...', name: 'GroupsPage');
     setState(() {
       _isLoadingMore[sessionId] = true;
     });
 
     final currentPage = _currentPage[sessionId] ?? 1;
     final nextPage = currentPage + 1;
-    developer.log('🟢 Page actuelle: $currentPage, Page suivante: $nextPage', name: 'GroupsPage');
+    _debugLog('🟢 Page actuelle: $currentPage, Page suivante: $nextPage', name: 'GroupsPage');
     
     try {
       await fetchGroups(sessionId: sessionId, page: nextPage, perPage: perPage, append: true);
-      developer.log('🟢 fetchGroups terminé avec succès', name: 'GroupsPage');
+      _debugLog('🟢 fetchGroups terminé avec succès', name: 'GroupsPage');
     } catch (e) {
-      developer.log('🔴 Erreur dans loadMoreGroups: $e', name: 'GroupsPage', error: e);
+      _debugLog('🔴 Erreur dans loadMoreGroups: $e', name: 'GroupsPage', error: e);
     } finally {
       if (mounted) {
         setState(() {
           _isLoadingMore[sessionId] = false;
         });
-        developer.log('🟢 _isLoadingMore[$sessionId] mis à false', name: 'GroupsPage');
+        _debugLog('🟢 _isLoadingMore[$sessionId] mis à false', name: 'GroupsPage');
       }
     }
   }
 
   Future<void> fetchCurrentGroupForSessions() async {
     final authProvider = Provider.of<AuthProvider>(context, listen: false);
+    final Map<int, List<Map<String, dynamic>>> updates = {};
+    String? newError;
 
-    for (var session in sessions) {
+    await Future.wait(sessions.map((session) async {
       final sessionId = session['id'];
       final String endpoint = '/api/management/get-current-group/$sessionId';
       try {
@@ -565,9 +796,7 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
               }
             }
           }
-          setState(() {
-            currentGroups[sessionId] = sessionCurrentGroups;
-          });
+          updates[sessionId] = sessionCurrentGroups;
         } else if (response.statusCode == 401 || response.statusCode == 403) {
           if (mounted) {
             SnackBarHelper.showError(context, 'Session expirée. Veuillez vous reconnecter.');
@@ -575,16 +804,18 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
           }
           await authProvider.logout();
         } else {
-          setState(() {
-            currentGroups[sessionId] = [];
-          });
+          updates[sessionId] = [];
         }
       } catch (e) {
-        setState(() {
-          currentGroups[sessionId] = [];
-          errorMessage = 'Erreur inattendue pour la session $sessionId : $e';
-        });
+        updates[sessionId] = [];
+        newError = 'Erreur inattendue pour la session $sessionId : $e';
       }
+    }));
+    if (mounted && updates.isNotEmpty) {
+      setState(() {
+        currentGroups.addAll(updates);
+        if (newError != null) errorMessage = newError;
+      });
     }
   }
 
@@ -672,10 +903,10 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
       _loadedMonths[sessionId] = {};
     }
     
-    final targetMonth = monthDate ?? _focusedDays[sessionId]!;
+    final targetMonth = monthDate ?? _focusedDays[sessionId] ?? DateTime.now();
     final monthKey = _getMonthKey(targetMonth);
     
-    if (_loadedMonths[sessionId]!.contains(monthKey) && !isPriority) {
+    if ((_loadedMonths[sessionId]?.contains(monthKey) ?? false) && !isPriority) {
       return;
     }
 
@@ -749,6 +980,16 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
               groupNameCache[groupId] = groupName;
             }
             
+            final members = int.tryParse((event['userCount'] ?? 0).toString()) ?? 0;
+            final capacity = int.tryParse((event['capacity'] ?? 0).toString()) ?? 0;
+            Map<String, dynamic>? groupFromList;
+            try {
+              groupFromList = groups.firstWhere(
+                (g) => g['groupId'] == groupId && g['sessionId'] == sessionId,
+              );
+            } catch (_) {
+              groupFromList = null;
+            }
             final eventData = {
               'id': event['id'],
               'ref': event['ref'],
@@ -763,19 +1004,30 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
               'groupName': groupName,
               'teacherName': event['teacherName'] ?? 'Unknown',
               'subjectName': event['subjectName'] ?? 'Unknown',
+              'hasEmptyRelation': event['hasEmptyRelation'] ?? groupFromList?['hasEmptyRelation'] ?? false,
+              'userOneRelation': event['userOneRelation'] ?? groupFromList?['userOneRelation'] ?? false,
+              'specialGroupStatus': event['specialGroupStatus'] ?? groupFromList?['specialGroupStatus'] ?? false,
+              'joined': event['isUserInGroup'] ?? groupFromList?['joined'] ?? false,
+              'members': members != 0 ? members : (groupFromList?['members'] ?? 0),
+              'capacity': capacity != 0 ? capacity : (groupFromList?['capacity'] ?? 0),
+              'type': event['type'] ?? event['accessType'] ?? groupFromList?['type'] ?? 'Normal',
+              'hasChangeRequest': _parseBool(event['hasChangeRequest'] ?? event['haschangeRequest'] ?? groupFromList?['hasChangeRequest']),
+              'hasJoinRequest': _parseBool(event['hasJoinRequest'] ?? event['hasjoinrequest'] ?? groupFromList?['hasJoinRequest']),
+              'pendingJoin': event['pendingJoin'] ?? groupFromList?['pendingJoin'] ?? false,
             };
 
             newEvents.putIfAbsent(normalizedDate, () => []);
-            newEvents[normalizedDate]!.add(eventData);
+            newEvents[normalizedDate]?.add(eventData);
           }
         }
       }
 
-      _loadedMonths[sessionId]!.add(monthKey);
+      _loadedMonths[sessionId]?.add(monthKey);
 
       if (mounted) {
         setState(() {
-          _sessionEvents[sessionId] = {..._sessionEvents[sessionId]!, ...newEvents};
+          final existing = _sessionEvents[sessionId] ?? {};
+          _sessionEvents[sessionId] = {...existing, ...newEvents};
           // Désactiver le loader immédiatement après avoir reçu les données
           _isLoadingCalendar[sessionId] = false;
         });
@@ -824,16 +1076,17 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
     final theme = Theme.of(context);
     final isDark = theme.brightness == Brightness.dark;
     final dateFormat = DateFormat('EEEE d MMMM yyyy', 'fr_FR');
+    final authProvider = Provider.of<AuthProvider>(context, listen: false);
 
     showDialog(
       context: context,
-      builder: (context) => Dialog(
+      builder: (dialogContext) => Dialog(
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
         backgroundColor: theme.dialogBackgroundColor,
         child: Container(
           constraints: BoxConstraints(maxHeight: MediaQuery.of(context).size.height * 0.7),
           child: Column(
-            mainAxisSize: MainAxisSize.min,
+            mainAxisSize: MainAxisSize.max,
             children: [
               Container(
                 padding: const EdgeInsets.all(16),
@@ -841,7 +1094,7 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
                   gradient: LinearGradient(
                     colors: isDark
                         ? const [Color(0xFF1A003D), Color(0xFF3C0D73)]
-                        : const [Color(0xFF8E2DE2), Color(0xFF4A00E0)],
+                  : const [Color(0xFF8E2DE2), Color(0xFF4A00E0)],
                     begin: Alignment.topLeft,
                     end: Alignment.bottomRight,
                   ),
@@ -865,12 +1118,12 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
                     ),
                     IconButton(
                       icon: const Icon(Icons.close, color: Colors.white),
-                      onPressed: () => Navigator.pop(context),
+                      onPressed: () => Navigator.pop(dialogContext),
                     ),
                   ],
                 ),
               ),
-              Flexible(
+              Expanded(
                 child: events.isEmpty
                     ? Padding(
                         padding: const EdgeInsets.all(32),
@@ -889,173 +1142,489 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
                         itemCount: events.length,
                         itemBuilder: (context, index) {
                           final event = events[index];
-                          final startTime = DateFormat('HH:mm').format(event['start'] as DateTime);
-                          final endTime = DateFormat('HH:mm').format(event['end'] as DateTime);
-                          final groupName = event['groupName'] ?? 'Groupe inconnu';
-                          final teacherName = event['teacherName'] ?? 'Enseignant non spécifié';
-                          final subjectName = event['subjectName'] ?? 'Matière non spécifiée';
-                          final description = event['description']?.toString().trim() ?? '';
+                          final groupId = event['groupId'] as int;
+                          return FutureBuilder<Map<String, bool>>(
+                            future: Future.wait([
+                              authProvider.getPendingChange(sessionId, groupId),
+                              authProvider.getPendingJoin(sessionId, groupId),
+                            ]).then((list) => {
+                              'isPendingChange': list[0] ?? false,
+                              'isPendingJoin': list[1] ?? false,
+                            }),
+                            builder: (context, snapshot) {
+                              final isPendingChange = snapshot.data?['isPendingChange'] ?? false;
+                              final prefsPendingJoin = snapshot.data?['isPendingJoin'] ?? false;
+                              final startTime = DateFormat('HH:mm').format(event['start'] as DateTime);
+                              final endTime = DateFormat('HH:mm').format(event['end'] as DateTime);
+                              final groupName = event['groupName'] ?? 'Groupe inconnu';
+                              final teacherName = event['teacherName'] ?? 'Enseignant non spécifié';
+                              final subjectName = event['subjectName'] ?? 'Matière non spécifiée';
+                              final description = event['description']?.toString().trim() ?? '';
+                              Map<String, dynamic>? groupFromList;
+                              try {
+                                groupFromList = groups.firstWhere(
+                                  (g) => g['groupId'] == groupId && g['sessionId'] == sessionId,
+                                );
+                              } catch (_) {
+                                groupFromList = null;
+                              }
+                              final groupData = groupFromList ?? event;
+                              final groupJoined = groupData['joined'] == true;
+                              final isPendingJoin = prefsPendingJoin || (groupData['pendingJoin'] == true);
+                              final groupMembers = int.tryParse((groupData['members'] ?? groupData['userCount'] ?? 0).toString()) ?? 0;
+                              final groupCapacity = int.tryParse((groupData['capacity'] ?? 0).toString()) ?? 0;
+                              final isGroupFull = groupMembers >= groupCapacity;
+                              final specialGroupStatus = groupData['specialGroupStatus'] == true;
+                              final hasEmptyRelation = groupData['hasEmptyRelation'] == true;
+                              final userOneRelation = groupData['userOneRelation'] == true;
+                              final groupType = (groupData['type'] ?? groupData['accessType'])?.toString() ?? 'Normal';
+                              final groupTypeLower = groupType.toLowerCase();
+                              final canLeaveGroup = groupJoined &&
+                                  specialGroupStatus &&
+                                  groupTypeLower != 'normal';
+                              final hasChangeRequest = _parseBool(groupData['hasChangeRequest']);
+                              final hasJoinRequest = _parseBool(groupData['hasJoinRequest']);
+                              final cacheLoaded = snapshot.connectionState == ConnectionState.done;
+                              final isNormalJoin = cacheLoaded && !specialGroupStatus && !groupJoined && !isGroupFull && hasEmptyRelation && !isPendingChange && !isPendingJoin && !hasChangeRequest && !hasJoinRequest;
+                              final isChangeRequest = cacheLoaded && !specialGroupStatus && !groupJoined && !isGroupFull && userOneRelation && !isPendingChange && !isPendingJoin && !hasChangeRequest && !hasJoinRequest;
+                              final isSpecialDirectBtn = cacheLoaded && specialGroupStatus && hasEmptyRelation && groupTypeLower == 'direct' && !groupJoined && !isGroupFull && !isPendingChange && !isPendingJoin && !hasChangeRequest && !hasJoinRequest;
+                              final isSpecialRequestBtn = cacheLoaded && specialGroupStatus && hasEmptyRelation && groupTypeLower == 'request' && !groupJoined && !isGroupFull && !isPendingChange && !isPendingJoin && !hasChangeRequest && !hasJoinRequest;
 
-                          return Card(
-                            margin: const EdgeInsets.only(bottom: 16),
-                            shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(16),
-                            ),
-                            elevation: 3,
-                            color: theme.cardColor,
-                            child: Padding(
-                              padding: const EdgeInsets.all(16),
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  // Barre verticale et nom du groupe
-                                  Row(
+                              return Card(
+                                margin: const EdgeInsets.only(bottom: 16),
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(16),
+                                ),
+                                elevation: 3,
+                                color: theme.cardColor,
+                                child: Padding(
+                                  padding: const EdgeInsets.all(16),
+                                  child: Column(
                                     crossAxisAlignment: CrossAxisAlignment.start,
                                     children: [
-                                      Container(
-                                        width: 4,
-                                        height: 60,
-                                        decoration: BoxDecoration(
-                                          color: theme.primaryColor,
-                                          borderRadius: BorderRadius.circular(2),
-                                        ),
+                                      // Barre verticale et nom du groupe
+                                      Row(
+                                        crossAxisAlignment: CrossAxisAlignment.start,
+                                        children: [
+                                          Container(
+                                            width: 4,
+                                            height: 60,
+                                            decoration: BoxDecoration(
+                                              color: theme.primaryColor,
+                                              borderRadius: BorderRadius.circular(2),
+                                            ),
+                                          ),
+                                          const SizedBox(width: 16),
+                                          Expanded(
+                                            child: Column(
+                                              crossAxisAlignment: CrossAxisAlignment.start,
+                                              children: [
+                                                Text(
+                                                  groupName,
+                                                  style: theme.textTheme.titleLarge?.copyWith(
+                                                    fontWeight: FontWeight.bold,
+                                                    fontSize: 20,
+                                                  ) ?? const TextStyle(
+                                                    fontWeight: FontWeight.bold,
+                                                    fontSize: 20,
+                                                  ),
+                                                ),
+                                                const SizedBox(height: 4),
+                                                if (event['title'] != null && event['title'].toString().isNotEmpty)
+                                                  Text(
+                                                    event['title'],
+                                                    style: theme.textTheme.bodyMedium?.copyWith(
+                                                      color: isDark ? Colors.grey[300] : Colors.grey[700],
+                                                      fontSize: 14,
+                                                    ) ?? TextStyle(
+                                                      color: isDark ? Colors.grey[300] : Colors.grey[700],
+                                                      fontSize: 14,
+                                                    ),
+                                                  ),
+                                              ],
+                                            ),
+                                          ),
+                                        ],
                                       ),
-                                      const SizedBox(width: 16),
-                                      Expanded(
-                                        child: Column(
-                                          crossAxisAlignment: CrossAxisAlignment.start,
-                                          children: [
-                                            // Nom du groupe en grand
-                                            Text(
-                                              groupName,
-                                              style: theme.textTheme.titleLarge?.copyWith(
-                                                fontWeight: FontWeight.bold,
-                                                fontSize: 20,
-                                              ) ?? const TextStyle(
-                                                fontWeight: FontWeight.bold,
-                                                fontSize: 20,
+                                      const SizedBox(height: 16),
+                                      Row(
+                                        children: [
+                                          Icon(
+                                            Icons.access_time,
+                                            size: 18,
+                                            color: theme.primaryColor,
+                                          ),
+                                          const SizedBox(width: 8),
+                                          Text(
+                                            '$startTime - $endTime',
+                                            style: theme.textTheme.bodyLarge?.copyWith(
+                                              color: theme.primaryColor,
+                                              fontWeight: FontWeight.w600,
+                                              fontSize: 16,
+                                            ) ?? TextStyle(
+                                              color: theme.primaryColor,
+                                              fontWeight: FontWeight.w600,
+                                              fontSize: 16,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                      const SizedBox(height: 12),
+                                      Row(
+                                        children: [
+                                          Icon(
+                                            Icons.person,
+                                            size: 18,
+                                            color: isDark ? Colors.grey[400] : Colors.grey[600],
+                                          ),
+                                          const SizedBox(width: 8),
+                                          Expanded(
+                                            child: Text(
+                                              'Enseignant : $teacherName',
+                                              style: theme.textTheme.bodyMedium?.copyWith(
+                                                color: isDark ? Colors.grey[300] : Colors.grey[700],
+                                              ) ?? TextStyle(
+                                                color: isDark ? Colors.grey[300] : Colors.grey[700],
                                               ),
                                             ),
-                                            const SizedBox(height: 4),
-                                            // Titre de la séance
-                                            if (event['title'] != null && event['title'].toString().isNotEmpty)
+                                          ),
+                                        ],
+                                      ),
+                                      const SizedBox(height: 8),
+                                      Row(
+                                        children: [
+                                          Icon(
+                                            Icons.book,
+                                            size: 18,
+                                            color: isDark ? Colors.grey[400] : Colors.grey[600],
+                                          ),
+                                          const SizedBox(width: 8),
+                                          Expanded(
+                                            child: Text(
+                                              'Matière : $subjectName',
+                                              style: theme.textTheme.bodyMedium?.copyWith(
+                                                color: isDark ? Colors.grey[300] : Colors.grey[700],
+                                              ) ?? TextStyle(
+                                                color: isDark ? Colors.grey[300] : Colors.grey[700],
+                                              ),
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                      if (description.isNotEmpty &&
+                                          !description.toLowerCase().contains('group') &&
+                                          !description.toLowerCase().contains('has learning') &&
+                                          !description.toLowerCase().contains('with teacher') &&
+                                          !description.toLowerCase().contains('on subject')) ...[
+                                        const SizedBox(height: 12),
+                                        const Divider(height: 1),
+                                        const SizedBox(height: 12),
+                                        Text(
+                                          'Description',
+                                          style: theme.textTheme.titleSmall?.copyWith(
+                                            fontWeight: FontWeight.bold,
+                                            color: isDark ? Colors.grey[300] : Colors.grey[700],
+                                          ) ?? TextStyle(
+                                            fontWeight: FontWeight.bold,
+                                            color: isDark ? Colors.grey[300] : Colors.grey[700],
+                                          ),
+                                        ),
+                                        const SizedBox(height: 4),
+                                        Text(
+                                          description,
+                                          style: theme.textTheme.bodyMedium?.copyWith(
+                                            color: isDark ? Colors.grey[400] : Colors.grey[600],
+                                            height: 1.4,
+                                          ) ?? TextStyle(
+                                            color: isDark ? Colors.grey[400] : Colors.grey[600],
+                                            height: 1.4,
+                                          ),
+                                        ),
+                                      ],
+                                      // Messages de statut (groupe complet, demandes en attente)
+                                      if (isGroupFull && !groupJoined)
+                                        Container(
+                                          padding: const EdgeInsets.all(8.0),
+                                          margin: const EdgeInsets.only(top: 12.0, bottom: 8.0),
+                                          decoration: BoxDecoration(
+                                            color: Colors.red.withOpacity(0.1),
+                                            borderRadius: BorderRadius.circular(8.0),
+                                          ),
+                                          child: Text(
+                                            'Ce groupe est complet',
+                                            style: TextStyle(
+                                              color: isDark ? Colors.red[300] : Colors.red[800],
+                                              fontWeight: FontWeight.bold,
+                                              fontSize: 14.0,
+                                            ),
+                                          ),
+                                        ),
+                                      if (hasChangeRequest)
+                                        Container(
+                                          padding: const EdgeInsets.all(8.0),
+                                          margin: const EdgeInsets.only(top: 8.0, bottom: 8.0),
+                                          decoration: BoxDecoration(
+                                            color: Colors.orange.withOpacity(0.1),
+                                            borderRadius: BorderRadius.circular(8.0),
+                                          ),
+                                          child: Text(
+                                            'L\'admin n\'a pas accepté le changement, il faut attendre',
+                                            style: TextStyle(
+                                              color: isDark ? Colors.orange[300] : Colors.orange[800],
+                                              fontWeight: FontWeight.bold,
+                                              fontSize: 14.0,
+                                            ),
+                                          ),
+                                        ),
+                                      if (hasJoinRequest && !groupJoined)
+                                        Container(
+                                          padding: const EdgeInsets.all(8.0),
+                                          margin: const EdgeInsets.only(top: 8.0, bottom: 8.0),
+                                          decoration: BoxDecoration(
+                                            color: Colors.orange.withOpacity(0.1),
+                                            borderRadius: BorderRadius.circular(8.0),
+                                          ),
+                                          child: Text(
+                                            'Il faut attendre l\'acceptation de l\'admin pour rejoindre ce groupe',
+                                            style: TextStyle(
+                                              color: isDark ? Colors.orange[300] : Colors.orange[800],
+                                              fontWeight: FontWeight.bold,
+                                              fontSize: 14.0,
+                                            ),
+                                          ),
+                                        ),
+                                      if (isPendingChange && !hasChangeRequest && !hasJoinRequest && cacheLoaded)
+                                        Container(
+                                          padding: const EdgeInsets.all(8.0),
+                                          margin: const EdgeInsets.only(top: 8.0, bottom: 8.0),
+                                          decoration: BoxDecoration(
+                                            color: Colors.orange.withOpacity(0.1),
+                                            borderRadius: BorderRadius.circular(8.0),
+                                          ),
+                                          child: Text(
+                                            'Tu as déjà demandé de changer de groupe, il faut attendre la validation de ta demande',
+                                            style: TextStyle(
+                                              color: isDark ? Colors.orange[300] : Colors.orange[800],
+                                              fontWeight: FontWeight.bold,
+                                              fontSize: 14.0,
+                                            ),
+                                          ),
+                                        ),
+                                      if (isPendingJoin && !groupJoined && specialGroupStatus && groupTypeLower == 'request' && !hasJoinRequest)
+                                        Container(
+                                          padding: const EdgeInsets.all(8.0),
+                                          margin: const EdgeInsets.only(top: 8.0, bottom: 8.0),
+                                          decoration: BoxDecoration(
+                                            color: Colors.orange.withOpacity(0.1),
+                                            borderRadius: BorderRadius.circular(8.0),
+                                          ),
+                                          child: Text(
+                                            'Une demande pour rejoindre ce groupe spécial est en attente de l\'acceptation de l\'admin',
+                                            style: TextStyle(
+                                              color: isDark ? Colors.orange[300] : Colors.orange[800],
+                                              fontWeight: FontWeight.bold,
+                                              fontSize: 14.0,
+                                            ),
+                                          ),
+                                        ),
+                                      if (isPendingJoin && !groupJoined && !(specialGroupStatus && groupTypeLower == 'request') && !hasJoinRequest)
+                                        Container(
+                                          padding: const EdgeInsets.all(8.0),
+                                          margin: const EdgeInsets.only(top: 8.0, bottom: 8.0),
+                                          decoration: BoxDecoration(
+                                            color: Colors.orange.withOpacity(0.1),
+                                            borderRadius: BorderRadius.circular(8.0),
+                                          ),
+                                          child: Text(
+                                            'Une demande d\'adhésion pour ce groupe est déjà en attente',
+                                            style: TextStyle(
+                                              color: isDark ? Colors.orange[300] : Colors.orange[800],
+                                              fontWeight: FontWeight.bold,
+                                              fontSize: 14.0,
+                                            ),
+                                          ),
+                                        ),
+                                      if (specialGroupStatus)
+                                        Padding(
+                                          padding: const EdgeInsets.only(top: 8.0),
+                                          child: Row(
+                                            children: [
+                                              Icon(Icons.star, color: Colors.blue, size: 20),
+                                              const SizedBox(width: 6),
                                               Text(
-                                                event['title'],
-                                                style: theme.textTheme.bodyMedium?.copyWith(
-                                                  color: isDark ? Colors.grey[300] : Colors.grey[700],
-                                                  fontSize: 14,
-                                                ) ?? TextStyle(
-                                                  color: isDark ? Colors.grey[300] : Colors.grey[700],
+                                                'Groupe Spécial',
+                                                style: TextStyle(
+                                                  color: Colors.blue,
+                                                  fontWeight: FontWeight.bold,
                                                   fontSize: 14,
                                                 ),
                                               ),
-                                          ],
-                                        ),
-                                      ),
-                                    ],
-                                  ),
-                                  const SizedBox(height: 16),
-                                  // Heure avec icône
-                                  Row(
-                                    children: [
-                                      Icon(
-                                        Icons.access_time,
-                                        size: 18,
-                                        color: theme.primaryColor,
-                                      ),
-                                      const SizedBox(width: 8),
-                                      Text(
-                                        '$startTime - $endTime',
-                                        style: theme.textTheme.bodyLarge?.copyWith(
-                                          color: theme.primaryColor,
-                                          fontWeight: FontWeight.w600,
-                                          fontSize: 16,
-                                        ) ?? TextStyle(
-                                          color: theme.primaryColor,
-                                          fontWeight: FontWeight.w600,
-                                          fontSize: 16,
-                                        ),
-                                      ),
-                                    ],
-                                  ),
-                                  const SizedBox(height: 12),
-                                  // Enseignant
-                                  Row(
-                                    children: [
-                                      Icon(
-                                        Icons.person,
-                                        size: 18,
-                                        color: isDark ? Colors.grey[400] : Colors.grey[600],
-                                      ),
-                                      const SizedBox(width: 8),
-                                      Expanded(
-                                        child: Text(
-                                          'Enseignant : $teacherName',
-                                          style: theme.textTheme.bodyMedium?.copyWith(
-                                            color: isDark ? Colors.grey[300] : Colors.grey[700],
-                                          ) ?? TextStyle(
-                                            color: isDark ? Colors.grey[300] : Colors.grey[700],
+                                            ],
                                           ),
                                         ),
-                                      ),
-                                    ],
-                                  ),
-                                  const SizedBox(height: 8),
-                                  // Matière
-                                  Row(
-                                    children: [
-                                      Icon(
-                                        Icons.book,
-                                        size: 18,
-                                        color: isDark ? Colors.grey[400] : Colors.grey[600],
-                                      ),
-                                      const SizedBox(width: 8),
-                                      Expanded(
-                                        child: Text(
-                                          'Matière : $subjectName',
-                                          style: theme.textTheme.bodyMedium?.copyWith(
-                                            color: isDark ? Colors.grey[300] : Colors.grey[700],
-                                          ) ?? TextStyle(
-                                            color: isDark ? Colors.grey[300] : Colors.grey[700],
+                                      // Boutons avec les mêmes conditions que la liste des groupes
+                                      if (isNormalJoin)
+                                        Padding(
+                                          padding: const EdgeInsets.only(top: 12.0),
+                                          child: SizedBox(
+                                            width: double.infinity,
+                                            child: ElevatedButton(
+                                              onPressed: () {
+                                                Navigator.pop(dialogContext);
+                                                showJoinGroupDialog(groupName, groupId, sessionId);
+                                              },
+                                              style: ElevatedButton.styleFrom(
+                                                backgroundColor: isDark ? Colors.deepPurple[700] : Colors.deepPurple.shade50,
+                                                foregroundColor: isDark ? Colors.white : Colors.deepPurple,
+                                                shape: RoundedRectangleBorder(
+                                                  borderRadius: BorderRadius.circular(10.0),
+                                                ),
+                                              ),
+                                              child: Text(
+                                                'Rejoindre nouveau groupe',
+                                                textAlign: TextAlign.center,
+                                                style: TextStyle(
+                                                  fontSize: 16.0,
+                                                  fontWeight: FontWeight.w600,
+                                                  color: isDark ? Colors.white : Colors.deepPurple[800],
+                                                ),
+                                              ),
+                                            ),
                                           ),
                                         ),
-                                      ),
+                                      if (isChangeRequest)
+                                        Padding(
+                                          padding: const EdgeInsets.only(top: 12.0),
+                                          child: SizedBox(
+                                            width: double.infinity,
+                                            child: ElevatedButton(
+                                              onPressed: () {
+                                                Navigator.pop(dialogContext);
+                                                showChangeGroupRequestDialog(groupName, groupId, sessionId);
+                                              },
+                                              style: ElevatedButton.styleFrom(
+                                                backgroundColor: theme.primaryColor,
+                                                foregroundColor: Colors.white,
+                                                shape: RoundedRectangleBorder(
+                                                  borderRadius: BorderRadius.circular(10.0),
+                                                ),
+                                              ),
+                                              child: Text(
+                                                'Demande de changement de groupe',
+                                                textAlign: TextAlign.center,
+                                                style: theme.textTheme.labelLarge?.copyWith(
+                                                  fontWeight: FontWeight.w600,
+                                                  color: Colors.white,
+                                                ) ?? const TextStyle(
+                                                  fontSize: 16.0,
+                                                  fontWeight: FontWeight.w600,
+                                                  color: Colors.white,
+                                                ),
+                                              ),
+                                            ),
+                                          ),
+                                        ),
+                                      if (isSpecialDirectBtn)
+                                        Padding(
+                                          padding: const EdgeInsets.only(top: 12.0),
+                                          child: SizedBox(
+                                            width: double.infinity,
+                                            child: ElevatedButton(
+                                              onPressed: () {
+                                                Navigator.pop(dialogContext);
+                                                showJoinSpecialGroupDialog(groupName, groupId, sessionId);
+                                              },
+                                              style: ElevatedButton.styleFrom(
+                                                backgroundColor: isDark ? Colors.blue[700] : Colors.blue.shade50,
+                                                foregroundColor: isDark ? Colors.white : Colors.blue,
+                                                shape: RoundedRectangleBorder(
+                                                  borderRadius: BorderRadius.circular(10.0),
+                                                ),
+                                              ),
+                                              child: Text(
+                                                'Rejoindre groupe spécial',
+                                                textAlign: TextAlign.center,
+                                                style: TextStyle(
+                                                  fontSize: 16.0,
+                                                  fontWeight: FontWeight.w600,
+                                                  color: isDark ? Colors.white : Colors.blue[800],
+                                                ),
+                                              ),
+                                            ),
+                                          ),
+                                        ),
+                                      if (isSpecialRequestBtn)
+                                        Padding(
+                                          padding: const EdgeInsets.only(top: 12.0),
+                                          child: SizedBox(
+                                            width: double.infinity,
+                                            child: ElevatedButton(
+                                              onPressed: () {
+                                                Navigator.pop(dialogContext);
+                                                showRequestSpecialGroupDialog(groupName, groupId, sessionId);
+                                              },
+                                              style: ElevatedButton.styleFrom(
+                                                backgroundColor: Colors.blue,
+                                                foregroundColor: Colors.white,
+                                                shape: RoundedRectangleBorder(
+                                                  borderRadius: BorderRadius.circular(10.0),
+                                                ),
+                                              ),
+                                              child: Text(
+                                                'Demande pour rejoindre groupe spécial',
+                                                textAlign: TextAlign.center,
+                                                style: theme.textTheme.labelLarge?.copyWith(
+                                                  fontWeight: FontWeight.w600,
+                                                  color: Colors.white,
+                                                ) ?? const TextStyle(
+                                                  fontSize: 16.0,
+                                                  fontWeight: FontWeight.w600,
+                                                  color: Colors.white,
+                                                ),
+                                              ),
+                                            ),
+                                          ),
+                                        ),
+                                      if (groupJoined)
+                                        Padding(
+                                          padding: const EdgeInsets.only(top: 12.0),
+                                          child: Text(
+                                            'Vous êtes membre',
+                                            style: TextStyle(color: Colors.green, fontWeight: FontWeight.w600),
+                                          ),
+                                        ),
+                                      if (canLeaveGroup) const SizedBox(height: 8.0),
+                                      if (canLeaveGroup)
+                                        SizedBox(
+                                          width: double.infinity,
+                                          child: ElevatedButton(
+                                            onPressed: () {
+                                              Navigator.pop(dialogContext);
+                                              leaveGroup(groupId, sessionId);
+                                            },
+                                            style: ElevatedButton.styleFrom(
+                                              backgroundColor: isDark ? Colors.red[700] : Colors.red.shade50,
+                                              foregroundColor: isDark ? Colors.white : Colors.red,
+                                              shape: RoundedRectangleBorder(
+                                                borderRadius: BorderRadius.circular(10.0),
+                                              ),
+                                            ),
+                                            child: Text(
+                                              'Quitter ce groupe',
+                                              textAlign: TextAlign.center,
+                                              style: TextStyle(
+                                                fontSize: 16.0,
+                                                fontWeight: FontWeight.w600,
+                                                color: isDark ? Colors.white : Colors.red[800],
+                                              ),
+                                            ),
+                                          ),
+                                        ),
                                     ],
                                   ),
-                                  // Description si elle existe et n'est pas technique
-                                  if (description.isNotEmpty && 
-                                      !description.toLowerCase().contains('group') &&
-                                      !description.toLowerCase().contains('has learning') &&
-                                      !description.toLowerCase().contains('with teacher') &&
-                                      !description.toLowerCase().contains('on subject')) ...[
-                                    const SizedBox(height: 12),
-                                    const Divider(height: 1),
-                                    const SizedBox(height: 12),
-                                    Text(
-                                      'Description',
-                                      style: theme.textTheme.titleSmall?.copyWith(
-                                        fontWeight: FontWeight.bold,
-                                        color: isDark ? Colors.grey[300] : Colors.grey[700],
-                                      ) ?? TextStyle(
-                                        fontWeight: FontWeight.bold,
-                                        color: isDark ? Colors.grey[300] : Colors.grey[700],
-                                      ),
-                                    ),
-                                    const SizedBox(height: 4),
-                                    Text(
-                                      description,
-                                      style: theme.textTheme.bodyMedium?.copyWith(
-                                        color: isDark ? Colors.grey[400] : Colors.grey[600],
-                                        height: 1.4,
-                                      ) ?? TextStyle(
-                                        color: isDark ? Colors.grey[400] : Colors.grey[600],
-                                        height: 1.4,
-                                      ),
-                                    ),
-                                  ],
-                                ],
-                              ),
-                            ),
+                                ),
+                              );
+                            },
                           );
                         },
                       ),
@@ -1094,12 +1663,12 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
       _loadedMonths[sessionId] = {};
     }
 
-    final focusedDay = _focusedDays[sessionId]!;
+    final focusedDay = _focusedDays[sessionId] ?? DateTime.now();
     final selectedDay = _selectedDays[sessionId];
-    final sessionName = sessions.firstWhere(
+    final sessionName = (sessions.firstWhere(
       (s) => s['id'] == sessionId,
       orElse: () => {'name': 'Session'},
-    )['name'];
+    )['name']) ?? 'Session';
 
     return Card(
       elevation: 4,
@@ -1171,7 +1740,7 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
               },
               eventLoader: (day) {
                 final events = _getEventsForDay(sessionId, day);
-                return events.map((e) => e['title'] as String).toList();
+                return events.map((e) => (e['title'] ?? 'Sans titre').toString()).toList();
               },
               calendarStyle: CalendarStyle(
                 todayDecoration: BoxDecoration(
@@ -1269,6 +1838,10 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
             currentGroups[sessionId]?.removeWhere((g) => g['groupId'] == groupId);
           }
         });
+        if (_loadedMonths.containsKey(sessionId)) {
+          _loadedMonths[sessionId]?.clear();
+        }
+        _fetchSessionCalendarEvents(sessionId, isPriority: true);
         await authProvider.removePendingChange(sessionId, groupId);
         await authProvider.removePendingJoin(sessionId, groupId);
       } else {
@@ -1352,12 +1925,14 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
                   );
                 }
 
-                calendarEvents = snapshot.data!;
+                calendarEvents = snapshot.data ?? [];
                 final eventsOnSelectedDate = calendarEvents.where((event) {
-                  final eventDate = event['date'] as DateTime;
-                  return eventDate.year == selectedDate.year &&
-                      eventDate.month == selectedDate.month &&
-                      eventDate.day == selectedDate.day;
+                  final eventDate = event['date'];
+                  if (eventDate == null || eventDate is! DateTime) return false;
+                  final dt = eventDate as DateTime;
+                  return dt.year == selectedDate.year &&
+                      dt.month == selectedDate.month &&
+                      dt.day == selectedDate.day;
                 }).toList();
 
                 return Dialog(
@@ -1565,13 +2140,14 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
     final authProvider = Provider.of<AuthProvider>(context, listen: false);
     final theme = Theme.of(context);
     final isDark = theme.brightness == Brightness.dark;
+    final BuildContext pageContext = context;
 
     final prefs = await authProvider.getPendingJoin(sessionId, groupId);
     final isPendingJoin = prefs ?? false;
 
     if (isPendingJoin) {
       if (mounted) {
-        SnackBarHelper.showWarning(context, 'Une demande est déjà en attente pour ce groupe.');
+        SnackBarHelper.showWarning(pageContext, 'Une demande est déjà en attente pour ce groupe.');
       }
       return;
     }
@@ -1583,7 +2159,7 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
 
     showDialog(
       context: context,
-      builder: (BuildContext context) {
+      builder: (BuildContext dialogContext) {
         return Dialog(
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20.0)),
           backgroundColor: theme.dialogBackgroundColor,
@@ -1621,7 +2197,7 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
                     mainAxisAlignment: MainAxisAlignment.end,
                     children: [
                       TextButton(
-                        onPressed: () => Navigator.pop(context),
+                        onPressed: () => Navigator.pop(dialogContext),
                         style: TextButton.styleFrom(foregroundColor: Colors.red),
                         child: Text(
                           'Annuler',
@@ -1646,7 +2222,7 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
                           try {
                             if (selectedGroup['members'] >= selectedGroup['capacity']) {
                               if (mounted) {
-                                SnackBarHelper.showError(context, 'Le groupe est complet.');
+                                SnackBarHelper.showWarning(pageContext, 'Le groupe est complet.');
                               }
                               return;
                             }
@@ -1660,11 +2236,14 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
                               }),
                             ).timeout(const Duration(seconds: 30));
 
-                            if (response.statusCode == 200) {
-                              Navigator.pop(context);
-                              if (mounted) {
-                                SnackBarHelper.showSuccess(context, successMessage);
-                              }
+                            if (response.statusCode == 200 || response.statusCode == 201) {
+                              Navigator.pop(dialogContext);
+                              // Délai pour que le dialogue se ferme avant d'afficher le SnackBar
+                              Future.delayed(const Duration(milliseconds: 400), () {
+                                if (mounted) {
+                                  SnackBarHelper.showSuccess(pageContext, successMessage);
+                                }
+                              });
                               setState(() {
                                 final group = groups.firstWhere(
                                       (g) => g['groupId'] == groupId,
@@ -1681,8 +2260,9 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
                                   if (!currentGroups.containsKey(sessionId)) {
                                     currentGroups[sessionId] = [];
                                   }
-                                  if (!currentGroups[sessionId]!.any((g) => g['groupId'] == groupId)) {
-                                    currentGroups[sessionId]!.add({
+                                  final cgList = currentGroups[sessionId];
+                                  if (cgList != null && !cgList.any((g) => g['groupId'] == groupId)) {
+                                    cgList.add({
                                       'sessionId': sessionId,
                                       'groupId': groupId,
                                       'name': selectedGroup['name'],
@@ -1690,13 +2270,17 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
                                   }
                                 }
                               });
+                              if (_loadedMonths.containsKey(sessionId)) {
+                                _loadedMonths[sessionId]?.clear();
+                              }
+                              _fetchSessionCalendarEvents(sessionId, isPriority: true);
                               if (isJoin || isSpecial) {
                                 await authProvider.removePendingJoin(sessionId, groupId);
                               } else if (isRequest) {
                                 await authProvider.setPendingJoin(sessionId, groupId, true);
                               }
                             } else {
-                              Navigator.pop(context);
+                              Navigator.pop(dialogContext);
                               String errorDetail = 'Échec de l\'opération : ${response.statusCode}';
                               if (response.body.isNotEmpty) {
                                 try {
@@ -1706,15 +2290,19 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
                                   errorDetail += ' - ${response.body}';
                                 }
                               }
-                              if (mounted) {
-                                SnackBarHelper.showError(context, errorDetail);
-                              }
+                              Future.delayed(const Duration(milliseconds: 400), () {
+                                if (mounted) {
+                                  SnackBarHelper.showWarning(pageContext, errorDetail);
+                                }
+                              });
                             }
                           } catch (e) {
-                            Navigator.pop(context);
-                            if (mounted) {
-                              SnackBarHelper.showError(context, 'Erreur : $e');
-                            }
+                            Navigator.pop(dialogContext);
+                            Future.delayed(const Duration(milliseconds: 400), () {
+                              if (mounted) {
+                                SnackBarHelper.showWarning(pageContext, 'Erreur : $e');
+                              }
+                            });
                           }
                         },
                         child: Text(
@@ -1747,8 +2335,8 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
       groupId: groupId,
       sessionId: sessionId,
       endpoint: '/api/management/join/new/group',
-      successMessage: 'Demande d\'adhésion envoyée avec succès',
-      isJoin: true,
+      successMessage: 'Demande envoyée, en attente de l\'acceptation de l\'admin',
+      isRequest: true,
     );
   }
 
@@ -1780,14 +2368,16 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
     final authProvider = Provider.of<AuthProvider>(context, listen: false);
     final theme = Theme.of(context);
     final isDark = theme.brightness == Brightness.dark;
+    // Référence pour rafraîchir la page (liste) après envoi réussi
+    final refreshPage = () {
+      if (mounted) setState(() {});
+    };
 
     final prefs = await authProvider.getPendingChange(sessionId, preferredGroupId);
     final isPendingChange = prefs ?? false;
 
     if (isPendingChange) {
-      if (mounted) {
-        SnackBarHelper.showWarning(context, 'Une demande de changement est déjà en attente.');
-      }
+      // Ne pas ouvrir le dialogue - le message est déjà affiché dans la liste
       return;
     }
 
@@ -1835,17 +2425,17 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
                       ),
                       const SizedBox(height: 20.0),
                       DropdownButtonFormField<int>(
-                        value: (currentGroups[sessionId] ?? []).isNotEmpty ? currentGroups[sessionId]![0]['groupId'] : null,
+                        value: (currentGroups[sessionId] ?? []).isNotEmpty ? (currentGroups[sessionId]?.firstOrNull?['groupId']) : null,
                         decoration: InputDecoration(
                           labelText: 'Groupe actuel',
                           labelStyle: TextStyle(color: isDark ? Colors.white70 : Colors.deepPurple[600]),
                           border: OutlineInputBorder(
                             borderRadius: BorderRadius.circular(12.0),
-                            borderSide: BorderSide(color: isDark ? Colors.white24 : Colors.grey[300]!),
+                            borderSide: BorderSide(color: isDark ? Colors.white24 : (Colors.grey[300] ?? Colors.grey)),
                           ),
                           enabledBorder: OutlineInputBorder(
                             borderRadius: BorderRadius.circular(12.0),
-                            borderSide: BorderSide(color: isDark ? Colors.white24 : Colors.grey[300]!),
+                            borderSide: BorderSide(color: isDark ? Colors.white24 : (Colors.grey[300] ?? Colors.grey)),
                           ),
                           focusedBorder: OutlineInputBorder(
                             borderRadius: BorderRadius.circular(12.0),
@@ -1883,11 +2473,11 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
                           hintText: 'Entrez la raison de votre demande...',
                           border: OutlineInputBorder(
                             borderRadius: BorderRadius.circular(12.0),
-                            borderSide: BorderSide(color: isDark ? Colors.white24 : Colors.grey[300]!),
+                            borderSide: BorderSide(color: isDark ? Colors.white24 : (Colors.grey[300] ?? Colors.grey)),
                           ),
                           enabledBorder: OutlineInputBorder(
                             borderRadius: BorderRadius.circular(12.0),
-                            borderSide: BorderSide(color: isDark ? Colors.white24 : Colors.grey[300]!),
+                            borderSide: BorderSide(color: isDark ? Colors.white24 : (Colors.grey[300] ?? Colors.grey)),
                           ),
                           focusedBorder: OutlineInputBorder(
                             borderRadius: BorderRadius.circular(12.0),
@@ -1931,11 +2521,13 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
                               padding: const EdgeInsets.symmetric(horizontal: 24.0, vertical: 12.0),
                               elevation: 2.0,
                             ),
-                            onPressed: selectedNewGroupId == null || _reasonController.text.trim().isEmpty
+                              onPressed: selectedNewGroupId == null || _reasonController.text.trim().isEmpty
                                 ? null
                                 : () async {
                               try {
-                                final currentGroupId = int.tryParse(selectedNewGroupId!);
+                                final newGroupId = selectedNewGroupId;
+                                if (newGroupId == null) return;
+                                final currentGroupId = int.tryParse(newGroupId);
                                 if (currentGroupId == null || currentGroupId <= 0) {
                                   if (mounted) {
                                     SnackBarHelper.showError(context, 'ID du groupe actuel invalide');
@@ -1969,32 +2561,19 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
 
                                 if (response.statusCode == 200) {
                                   Navigator.pop(context);
+                                  await authProvider.setPendingChange(sessionId, preferredGroupId, true);
                                   if (mounted) {
-                                    SnackBarHelper.showSuccess(context, 'Demande envoyée avec succès');
-                                  }
-                                  setState(() {
                                     final group = groups.firstWhere(
-                                          (g) => g['groupId'] == preferredGroupId,
-                                      orElse: () => {},
+                                          (g) => g['groupId'] == preferredGroupId && g['sessionId'] == sessionId,
+                                      orElse: () => <String, dynamic>{},
                                     );
                                     if (group.isNotEmpty) {
-                                      group['pendingJoin'] = true;
-                                      group['members'] = (group['members'] as int) + 1;
-                                      if (!currentGroups.containsKey(sessionId)) {
-                                        currentGroups[sessionId] = [];
-                                      }
-                                      if (!currentGroups[sessionId]!.any((g) => g['groupId'] == preferredGroupId)) {
-                                        currentGroups[sessionId]!.add({
-                                          'sessionId': sessionId,
-                                          'groupId': preferredGroupId,
-                                          'name': selectedGroup['name'],
-                                        });
-                                      }
+                                      group['hasChangeRequest'] = true;
                                     }
                                     selectedNewGroupId = null;
                                     _reasonController.clear();
-                                  });
-                                  await authProvider.setPendingChange(sessionId, preferredGroupId, true);
+                                    refreshPage();
+                                  }
                                 } else {
                                   Navigator.pop(context);
                                   String errorDetail = 'Échec de la demande : ${response.statusCode}';
@@ -2044,64 +2623,23 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
 
   @override
   Widget build(BuildContext context) {
-    final authProvider = Provider.of<AuthProvider>(context, listen: false);
     final theme = Theme.of(context);
     final themeProvider = context.watch<ThemeProvider>();
     final isDark = theme.brightness == Brightness.dark;
 
+    // N'appeler _updateAppBarConfigIfNeeded que si sessions/isLoading ont changé (réduit les rebuilds)
+    if (sessions.length != _lastAppBarSessionsLength || isLoading != _lastAppBarLoading) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _updateAppBarConfigIfNeeded();
+      });
+    }
+
     return LoadingWrapper(
-      child: Scaffold(
-        appBar: AppBar(
-          leading: Builder(
-            builder: (BuildContext context) {
-              return IconButton(
-                icon: Icon(Icons.menu, color: theme.appBarTheme.iconTheme?.color ?? Colors.white),
-                onPressed: () {
-                  Scaffold.of(context).openDrawer();
-                },
-              );
-            },
-          ),
-          title: Text(
-            'Groupes de révision',
-            style: theme.textTheme.headlineSmall?.copyWith(
-              color: Colors.white,
-            ) ?? const TextStyle(
-              fontSize: 22,
-              fontWeight: FontWeight.bold,
-              color: Colors.white,
-            ),
-          ),
-          centerTitle: false, // Aligne le titre à gauche
-          backgroundColor: Colors.transparent,
-          elevation: 0,
-          iconTheme: theme.iconTheme,
-          flexibleSpace: Container(
-            decoration: BoxDecoration(
-              gradient: LinearGradient(
-                colors: isDark
-                    ? const [Color(0xFF1A003D), Color(0xFF3C0D73)]
-                    : const [Color(0xFF8E2DE2), Color(0xFF4A00E0)],
-                begin: Alignment.topLeft,
-                end: Alignment.bottomRight,
-              ),
-            ),
-          ),
-          bottom: isLoading || sessions.isEmpty
-              ? null
-              : TabBar(
-            controller: _tabController,
-            isScrollable: true,
-            tabs: sessions.map((session) => Tab(text: session['name'])).toList(),
-            indicatorColor: Colors.white,
-            labelColor: Colors.white,
-            unselectedLabelColor: Colors.white70,
-          ),
-        ),
-        drawer: const AppSidebar(),
-        body: isLoading
-            ? const SizedBox.shrink()
-            : sessions.isEmpty
+      child: isLoading
+          ? Center(
+              child: CircularProgressIndicator(color: themeProvider.primaryColor),
+            )
+          : sessions.isEmpty
             ? RefreshIndicator(
           onRefresh: refreshData,
           child: SingleChildScrollView(
@@ -2149,16 +2687,39 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
             ),
           ),
         )
-            : TabBarView(
+            : Column(
+          children: [
+            // TabBar dans le body (même cycle de vie que TabController, évite "used after disposed")
+            // Même gradient que l'AppBar pour cohérence visuelle en mode clair et sombre
+            if (_isTabControllerSynced)
+              Container(
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    colors: themeProvider.themeMode == ThemeMode.dark
+                        ? const [Color(0xFF1A003D), Color(0xFF3C0D73)]
+                  : const [Color(0xFF8E2DE2), Color(0xFF4A00E0)],
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                  ),
+                ),
+                child: TabBar(
+                  controller: _tabController!,
+                  isScrollable: true,
+                  tabs: sessions.map((s) => Tab(text: s['name'] as String)).toList(),
+                  indicatorColor: Colors.white,
+                  labelColor: Colors.white,
+                  unselectedLabelColor: Colors.white70,
+                ),
+              ),
+            Expanded(
+              child: _isTabControllerSynced
+                  ? TabBarView(
           controller: _tabController,
           children: sessions.map((session) {
             final sessionGroups = groups.where((group) => group['sessionId'] == session['id']).toList();
             final currentGroupsForSession = currentGroups[session['id']] ?? [];
             final sessionId = session['id'];
             
-            developer.log('📊 Affichage sessionId: $sessionId - Nombre de groupes à afficher: ${sessionGroups.length}', name: 'GroupsPage');
-            developer.log('📊 État pagination - currentPage: ${_currentPage[sessionId]}, hasMorePages: ${_hasMorePages[sessionId]}, isLoadingMore: ${_isLoadingMore[sessionId]}', name: 'GroupsPage');
-
             // Initialiser les structures pour cette session si nécessaire
             if (!_focusedDays.containsKey(sessionId)) {
               _focusedDays[sessionId] = DateTime.now();
@@ -2182,18 +2743,10 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
               }
             }
             
-            // Charger les événements du calendrier pour cette session si nécessaire
-            // Le premier calendrier est déjà chargé dans _checkAuthAndFetchData
-            // Pour les autres sessions, charger en arrière-plan sans loader
-            if (!_loadedMonths.containsKey(sessionId) || _loadedMonths[sessionId]!.isEmpty) {
-              // Charger le mois actuel sans priorité (en arrière-plan)
-              _fetchSessionCalendarEvents(sessionId, isPriority: false);
-              // Charger les autres mois en arrière-plan après un court délai
-              Future.delayed(const Duration(milliseconds: 300), () {
-                if (mounted) {
-                  _loadOtherMonthsInBackground(sessionId);
-                }
-              });
+            // Charger le calendrier une seule fois (pas à chaque rebuild)
+            if (!_loadedMonths.containsKey(sessionId) ||
+                (_loadedMonths[sessionId]?.isEmpty ?? true)) {
+              _scheduleCalendarFetch(sessionId, isPriority: false);
             }
 
             return RefreshIndicator(
@@ -2206,28 +2759,23 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
                 await refreshData();
                 // Recharger le calendrier après le refresh
                 if (_loadedMonths.containsKey(sessionId)) {
-                  _loadedMonths[sessionId]!.clear();
+                  _loadedMonths[sessionId]?.clear();
                 }
                 _fetchSessionCalendarEvents(sessionId, isPriority: true);
               },
               child: NotificationListener<ScrollNotification>(
                 onNotification: (ScrollNotification scrollInfo) {
-                  // Détecter quand on atteint la fin du scroll
                   final pixels = scrollInfo.metrics.pixels;
-                  final maxScrollExtent = scrollInfo.metrics.maxScrollExtent;
-                  final threshold = maxScrollExtent - 200;
-                  
-                  developer.log('📜 Scroll détecté - pixels: $pixels, maxScrollExtent: $maxScrollExtent, threshold: $threshold', name: 'GroupsPage');
-                  developer.log('📜 hasMorePages: ${_hasMorePages[sessionId]}, isLoadingMore: ${_isLoadingMore[sessionId]}', name: 'GroupsPage');
-                  
-                  if (pixels >= threshold) {
-                    developer.log('📜 Seuil atteint! Vérification des conditions...', name: 'GroupsPage');
-                    if (_hasMorePages[sessionId] == true && 
-                        _isLoadingMore[sessionId] != true) {
-                      developer.log('📜 ✅ Conditions remplies, appel de loadMoreGroups pour sessionId: $sessionId', name: 'GroupsPage');
+                  final threshold = scrollInfo.metrics.maxScrollExtent - 200;
+                  if (pixels >= threshold &&
+                      _hasMorePages[sessionId] == true &&
+                      _isLoadingMore[sessionId] != true) {
+                    // Debounce: max 1 appel toutes les 800ms par session
+                    final now = DateTime.now();
+                    final last = _lastLoadMoreTrigger[sessionId];
+                    if (last == null || now.difference(last).inMilliseconds > 800) {
+                      _lastLoadMoreTrigger[sessionId] = now;
                       loadMoreGroups(sessionId);
-                    } else {
-                      developer.log('📜 ❌ Conditions non remplies - hasMorePages: ${_hasMorePages[sessionId]}, isLoadingMore: ${_isLoadingMore[sessionId]}', name: 'GroupsPage');
                     }
                   }
                   return false;
@@ -2239,8 +2787,8 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
                     padding: const EdgeInsets.all(16.0),
                     child: Column(
                       children: [
-                        // Calendrier pour cette session
-                        _buildSessionCalendar(sessionId),
+                        // Calendrier pour cette session (RepaintBoundary isole les repaints)
+                        RepaintBoundary(child: _buildSessionCalendar(sessionId)),
                         // Liste des groupes
                         if (sessionGroups.isEmpty)
                           SizedBox(
@@ -2254,22 +2802,27 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
                           )
                         else
                           ...sessionGroups.map((group) {
-                          final progress = (group['members'] as int) / (group['capacity'] as int);
-                          final isGroupFull = (group['members'] as int) >= (group['capacity'] as int);
+                          final members = (group['members'] is int)
+                              ? (group['members'] as int)
+                              : (int.tryParse((group['members'] ?? 0).toString()) ?? 0);
+                          final capacity = (group['capacity'] is int)
+                              ? (group['capacity'] as int)
+                              : (int.tryParse((group['capacity'] ?? 1).toString()) ?? 1);
+                          final progress = capacity > 0 ? members / capacity : 0.0;
+                          final isGroupFull = members >= capacity;
                           final canLeaveGroup = group['joined'] == true &&
                               group['specialGroupStatus'] == true &&
                               group['type'] != 'Normal';
+                          final pendingKey = _pendingKey(sessionId, group['groupId']);
+                          final isPendingChange = _pendingChangeFlags[pendingKey] ?? false;
+                          final isPendingJoin = (_pendingJoinFlags[pendingKey] ?? false) ||
+                              (group['pendingJoin'] == true);
+                          final hasChangeRequest = _parseBool(group['hasChangeRequest']);
+                          final hasJoinRequest = _parseBool(group['hasJoinRequest']);
+                          // Flags déjà hydratés synchroniquement → boutons visibles tout de suite
+                          const cacheLoaded = true;
 
-                          return FutureBuilder<bool?>(
-                            future: authProvider.getPendingChange(sessionId, group['groupId']),
-                            builder: (context, changeSnapshot) {
-                              return FutureBuilder<bool?>(
-                                future: authProvider.getPendingJoin(sessionId, group['groupId']),
-                                builder: (context, joinSnapshot) {
-                                  final isPendingChange = changeSnapshot.data ?? false;
-                                  final isPendingJoin = joinSnapshot.data ?? false;
-
-                                  return Card(
+                          return Card(
                                     margin: const EdgeInsets.only(bottom: 16.0),
                                     shape: RoundedRectangleBorder(
                                       borderRadius: BorderRadius.circular(16.0),
@@ -2284,7 +2837,7 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
                                             crossAxisAlignment: CrossAxisAlignment.start,
                                             children: [
                                               Text(
-                                                group['name'],
+                                                (group['name'] ?? 'Sans nom').toString(),
                                                 style: theme.textTheme.titleMedium?.copyWith(
                                                   fontWeight: FontWeight.bold,
                                                 ) ?? const TextStyle(
@@ -2294,14 +2847,14 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
                                               ),
                                               const SizedBox(height: 4.0),
                                               Text(
-                                                '${group['teacher']} • ${group['subject']}',
+                                                '${group['teacher'] ?? 'Enseignant'} • ${group['subject'] ?? 'Matière'}',
                                                 style: theme.textTheme.bodyMedium,
                                               ),
                                               const SizedBox(height: 12.0),
                                               ClipRRect(
                                                 borderRadius: BorderRadius.circular(8.0),
                                                 child: LinearProgressIndicator(
-                                                  value: progress,
+                                                  value: progress.clamp(0.0, 1.0),
                                                   backgroundColor: isDark ? Colors.grey[700] : Colors.deepPurple.shade100,
                                                   color: theme.primaryColor,
                                                   minHeight: 6.0,
@@ -2333,7 +2886,41 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
                                               ),
                                             ),
                                           ),
-                                        if (isPendingChange)
+                                        if (hasChangeRequest)
+                                          Container(
+                                            padding: const EdgeInsets.all(8.0),
+                                            margin: const EdgeInsets.only(bottom: 8.0),
+                                            decoration: BoxDecoration(
+                                              color: Colors.orange.withOpacity(0.1),
+                                              borderRadius: BorderRadius.circular(8.0),
+                                            ),
+                                            child: Text(
+                                              'L\'admin n\'a pas accepté le changement, il faut attendre',
+                                              style: TextStyle(
+                                                color: isDark ? Colors.orange[300] : Colors.orange[800],
+                                                fontWeight: FontWeight.bold,
+                                                fontSize: 14.0,
+                                              ),
+                                            ),
+                                          ),
+                                        if (hasJoinRequest && !group['joined'])
+                                          Container(
+                                            padding: const EdgeInsets.all(8.0),
+                                            margin: const EdgeInsets.only(bottom: 8.0),
+                                            decoration: BoxDecoration(
+                                              color: Colors.orange.withOpacity(0.1),
+                                              borderRadius: BorderRadius.circular(8.0),
+                                            ),
+                                            child: Text(
+                                              'Il faut attendre l\'acceptation de l\'admin pour rejoindre ce groupe',
+                                              style: TextStyle(
+                                                color: isDark ? Colors.orange[300] : Colors.orange[800],
+                                                fontWeight: FontWeight.bold,
+                                                fontSize: 14.0,
+                                              ),
+                                            ),
+                                          ),
+                                        if (isPendingChange && !hasChangeRequest && !hasJoinRequest && cacheLoaded)
                                           Container(
                                             padding: const EdgeInsets.all(8.0),
                                             margin: const EdgeInsets.only(bottom: 8.0),
@@ -2350,7 +2937,7 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
                                               ),
                                             ),
                                           ),
-                                        if (isPendingJoin && !group['joined'] && group['specialGroupStatus'] && group['type'] == 'Request')
+                                        if (isPendingJoin && !group['joined'] && group['specialGroupStatus'] && group['type'] == 'Request' && !hasJoinRequest)
                                           Container(
                                             padding: const EdgeInsets.all(8.0),
                                             margin: const EdgeInsets.only(bottom: 8.0),
@@ -2367,7 +2954,7 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
                                               ),
                                             ),
                                           ),
-                                        if (isPendingJoin && !group['joined'] && !(group['specialGroupStatus'] && group['type'] == 'Request'))
+                                        if (isPendingJoin && !group['joined'] && !(group['specialGroupStatus'] && group['type'] == 'Request') && !hasJoinRequest)
                                           Container(
                                             padding: const EdgeInsets.all(8.0),
                                             margin: const EdgeInsets.only(bottom: 8.0),
@@ -2384,7 +2971,7 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
                                               ),
                                             ),
                                           ),
-                                        if (!group['specialGroupStatus'] && !group['joined'] && !isGroupFull && group['hasEmptyRelation'] && !isPendingChange && !isPendingJoin)
+                                        if (cacheLoaded && !group['specialGroupStatus'] && !group['joined'] && !isGroupFull && group['hasEmptyRelation'] && !isPendingChange && !isPendingJoin && !hasChangeRequest && !hasJoinRequest)
                                           SizedBox(
                                             width: double.infinity,
                                             child: ElevatedButton(
@@ -2402,6 +2989,7 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
                                               ),
                                               child: Text(
                                                 'Rejoindre nouveau groupe',
+                                                textAlign: TextAlign.center,
                                                 style: TextStyle(
                                                   fontSize: 16.0,
                                                   fontWeight: FontWeight.w600,
@@ -2410,7 +2998,7 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
                                               ),
                                             ),
                                           ),
-                                        if (!group['specialGroupStatus'] && !group['joined'] && !isGroupFull && group['userOneRelation'] && !isPendingChange && !isPendingJoin)
+                                        if (cacheLoaded && !group['specialGroupStatus'] && !group['joined'] && !isGroupFull && group['userOneRelation'] && !isPendingChange && !isPendingJoin && !hasChangeRequest && !hasJoinRequest)
                                           SizedBox(
                                             width: double.infinity,
                                             child: ElevatedButton(
@@ -2428,6 +3016,7 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
                                               ),
                                               child: Text(
                                                 'Demande de changement de groupe',
+                                                textAlign: TextAlign.center,
                                                 style: theme.textTheme.labelLarge?.copyWith(
                                                   fontWeight: FontWeight.w600,
                                                   color: Colors.white,
@@ -2439,7 +3028,7 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
                                               ),
                                             ),
                                           ),
-                                        if (group['specialGroupStatus'] && group['hasEmptyRelation'] && group['type'] == 'Direct' && !group['joined'] && !isGroupFull && !isPendingChange && !isPendingJoin)
+                                        if (cacheLoaded && group['specialGroupStatus'] && group['hasEmptyRelation'] && group['type'] == 'Direct' && !group['joined'] && !isGroupFull && !isPendingChange && !isPendingJoin && !hasChangeRequest && !hasJoinRequest)
                                           SizedBox(
                                             width: double.infinity,
                                             child: ElevatedButton(
@@ -2457,6 +3046,7 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
                                               ),
                                               child: Text(
                                                 'Rejoindre groupe spécial',
+                                                textAlign: TextAlign.center,
                                                 style: TextStyle(
                                                   fontSize: 16.0,
                                                   fontWeight: FontWeight.w600,
@@ -2465,7 +3055,7 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
                                               ),
                                             ),
                                           ),
-                                        if (group['specialGroupStatus'] && group['hasEmptyRelation'] && group['type'] == 'Request' && !group['joined'] && !isGroupFull && !isPendingChange && !isPendingJoin)
+                                        if (cacheLoaded && group['specialGroupStatus'] && group['hasEmptyRelation'] && group['type'] == 'Request' && !group['joined'] && !isGroupFull && !isPendingChange && !isPendingJoin && !hasChangeRequest && !hasJoinRequest)
                                           SizedBox(
                                             width: double.infinity,
                                             child: ElevatedButton(
@@ -2483,6 +3073,7 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
                                               ),
                                               child: Text(
                                                 'Demande pour rejoindre groupe spécial',
+                                                textAlign: TextAlign.center,
                                                 style: theme.textTheme.labelLarge?.copyWith(
                                                   fontWeight: FontWeight.w600,
                                                   color: Colors.white,
@@ -2494,7 +3085,7 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
                                               ),
                                             ),
                                           ),
-                                        if (group['joined'])
+                                        if (group['joined'] == true)
                                           Text(
                                             'Vous êtes membre',
                                             style: TextStyle(color: Colors.green),
@@ -2517,6 +3108,7 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
                                               ),
                                               child: Text(
                                                 'Quitter ce groupe',
+                                                textAlign: TextAlign.center,
                                                 style: TextStyle(
                                                   fontSize: 16.0,
                                                   fontWeight: FontWeight.w600,
@@ -2540,10 +3132,6 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
                                 ),
                               ),
                             );
-                          },
-                        );
-                      },
-                    );
                   }).toList(),
                       // Indicateur de chargement pour la pagination
                       if (_isLoadingMore[sessionId] == true)
@@ -2560,7 +3148,11 @@ class _GroupsPageState extends State<GroupsPage> with TickerProviderStateMixin {
               ),
             );
           }).toList(),
-        ),
+        )
+                  : const SizedBox.shrink(),
+            ),
+
+    ],
       ),
     );
   }

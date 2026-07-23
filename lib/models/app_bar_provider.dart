@@ -22,7 +22,7 @@ class AppBarProvider with ChangeNotifier {
   // Configuration par défaut pour chaque page
   final Map<int, AppBarConfig> _defaultConfigs = {
     0: AppBarConfig(title: 'Tableau de bord'),
-    1: AppBarConfig(title: 'Mes cours'),
+    1: AppBarConfig(title: 'Groupes'),
     2: AppBarConfig(title: 'Fil Social'),
     3: AppBarConfig(title: 'Ressources'),
     4: AppBarConfig(title: 'Profil'),

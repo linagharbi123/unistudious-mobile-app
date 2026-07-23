@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import '../services/token_service.dart';
 import '../services/firebase_notification_service.dart';
+import '../services/page_cache_service.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter/scheduler.dart';
@@ -83,6 +84,8 @@ class AuthProvider extends ChangeNotifier {
 
   // Login
   Future<bool> login(String username, String password) async {
+    if (_isLoading) return false;
+
     _isLoading = true;
     _error = null;
     notifyListeners();
@@ -119,6 +122,8 @@ class AuthProvider extends ChangeNotifier {
 
   // Logout
   Future<void> logout() async {
+    if (_isLoading) return;
+
     _isLoading = true;
     notifyListeners();
 
@@ -133,6 +138,7 @@ class AuthProvider extends ChangeNotifier {
       await FirebaseNotificationService.deleteToken();
       
       await _tokenService.logout();
+      await PageCacheService.clearAllForUser(authToken);
       _isLoggedIn = false;
       _error = null;
       _finalUsername = null; // Effacer finalUsername lors de la déconnexion
@@ -188,6 +194,7 @@ class AuthProvider extends ChangeNotifier {
     await FirebaseNotificationService.deleteToken();
     
     await _tokenService.logout();
+    await PageCacheService.clearAllForUser(authToken);
     _isLoggedIn = false;
     _error = null;
     _finalUsername = null; // Effacer finalUsername

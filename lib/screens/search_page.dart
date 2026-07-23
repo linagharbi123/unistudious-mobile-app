@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'dart:developer' as developer;
+import '../utils/app_bar_gradient.dart';
 import '../widgets/notification_icon_button.dart';
 
 class SearchPage extends StatefulWidget {
@@ -153,12 +154,16 @@ class _SearchPageState extends State<SearchPage> {
 
   @override
   Widget build(BuildContext context) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
     developer.log(
       'Building SearchPage, filtered posts: ${_isHashtagSearch ? _hashtagPosts.length : _filteredPosts.length}, isHashtagSearch: $_isHashtagSearch',
       name: 'SearchPage',
     );
     return Scaffold(
       appBar: AppBar(
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        flexibleSpace: AppBarGradient.flexibleSpace(isDark),
         title: Text(
           'Rechercher',
           style: TextStyle(
@@ -166,7 +171,6 @@ class _SearchPageState extends State<SearchPage> {
             fontFamily: GoogleFonts.poppins().fontFamily,
           ),
         ),
-        backgroundColor: Colors.deepPurple,
         leading: IconButton(
           icon: const Icon(Icons.arrow_back, color: Colors.white),
           onPressed: () {

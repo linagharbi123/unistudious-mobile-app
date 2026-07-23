@@ -1060,15 +1060,24 @@ class _SessionDetailPageState extends State<SessionDetailPage> {
   Map<String, bool> hasRegistered = {};
   bool isDark = false;
   final ImagePicker _picker = ImagePicker();
+  late PageController _pageController;
+  int _currentPageIndex = 0;
 
   @override
   void initState() {
     super.initState();
+    _pageController = PageController();
     developer.log(
         'Initializing SessionDetailPage with accountId: ${widget.accountId}, token: ${widget.token}',
         name: 'SessionDetailPage');
     _loadRegistrationStatus();
     fetchSessionDetails();
+  }
+
+  @override
+  void dispose() {
+    _pageController.dispose();
+    super.dispose();
   }
 
   Future<void> _loadRegistrationStatus() async {
@@ -1194,12 +1203,12 @@ class _SessionDetailPageState extends State<SessionDetailPage> {
   Widget _infoRow(IconData icon, String label, String? value) {
     final theme = Theme.of(context);
     return Padding(
-      padding: const EdgeInsets.only(bottom: 10.0),
+      padding: const EdgeInsets.only(bottom: 6.0),
       child: Row(
         children: [
           Icon(icon, size: 20, color: theme.iconTheme.color),
           const SizedBox(width: 8),
-          RichText(
+                RichText(
             text: TextSpan(
               children: [
                 TextSpan(
@@ -2104,12 +2113,21 @@ class _SessionDetailPageState extends State<SessionDetailPage> {
               ),
         ),
       )
-          : SingleChildScrollView(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          children: widget.sessions.map((session) {
-            developer.log('Rendering card for session: ${session['sessionName']}', name: 'SessionDetailPage');
-            return Card(
+          : Column(
+        children: [
+          Expanded(
+            child: Stack(
+              children: [
+                PageView.builder(
+              controller: _pageController,
+              itemCount: widget.sessions.length,
+              onPageChanged: (index) => setState(() => _currentPageIndex = index),
+              itemBuilder: (context, index) {
+                final session = widget.sessions[index];
+                developer.log('Rendering card for session: ${session['sessionName']}', name: 'SessionDetailPage');
+                return SingleChildScrollView(
+                  padding: const EdgeInsets.all(16),
+                  child: Card(
               elevation: 8,
               shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
               margin: const EdgeInsets.only(bottom: 16),
@@ -2161,17 +2179,32 @@ class _SessionDetailPageState extends State<SessionDetailPage> {
                         ),
                       ),
                     ),
-                    const SizedBox(height: 20),
+                    const SizedBox(height: 12),
                     Container(
                       width: double.infinity,
-                      padding: const EdgeInsets.all(12),
+                      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 18),
                       decoration: BoxDecoration(
-                        color: isDark ? theme.dividerColor.withOpacity(0.1) : theme.dividerColor.withOpacity(0.1),
-                        borderRadius: BorderRadius.circular(8),
-                        border: Border.all(
-                          color: isDark ? theme.dividerColor : theme.dividerColor,
-                          width: 1,
+                        gradient: LinearGradient(
+                          begin: Alignment.topLeft,
+                          end: Alignment.bottomRight,
+                          colors: isDark
+                              ? [
+                                  const Color(0xFF2D1B4E).withOpacity(0.9),
+                                  const Color(0xFF1A003D).withOpacity(0.7),
+                                ]
+                              : [
+                                  theme.primaryColor.withOpacity(0.15),
+                                  theme.primaryColor.withOpacity(0.06),
+                                ],
                         ),
+                        borderRadius: BorderRadius.circular(16),
+                        boxShadow: [
+                          BoxShadow(
+                            color: theme.primaryColor.withOpacity(0.2),
+                            blurRadius: 12,
+                            offset: const Offset(0, 4),
+                          ),
+                        ],
                       ),
                       child: Text(
                         session['sessionName']?.isNotEmpty == true ? session['sessionName'] : 'Unnamed Session',
@@ -2179,17 +2212,19 @@ class _SessionDetailPageState extends State<SessionDetailPage> {
                           fontWeight: FontWeight.bold,
                           fontFamily: GoogleFonts.poppins().fontFamily,
                           color: isDark ? Colors.white : theme.primaryColor,
+                          letterSpacing: 0.3,
                         ) ??
                             TextStyle(
-                              fontSize: 24,
+                              fontSize: 22,
                               fontWeight: FontWeight.bold,
                               color: isDark ? Colors.white : theme.primaryColor,
                               fontFamily: GoogleFonts.poppins().fontFamily,
+                              letterSpacing: 0.3,
                             ),
                         textAlign: TextAlign.center,
                       ),
                     ),
-                    const SizedBox(height: 20),
+                    const SizedBox(height: 12),
                     ListView(
                       shrinkWrap: true,
                       physics: const NeverScrollableScrollPhysics(),
@@ -2199,50 +2234,75 @@ class _SessionDetailPageState extends State<SessionDetailPage> {
                         _infoRow(Icons.event, "Fin", session['endDate']),
                         _infoRow(Icons.account_balance, "Compte", session['accountName'] ?? 'Piuma Academy'),
                         _infoRow(Icons.payment, "Méthode de paiement", session['typePay']),
-                        _infoRow(Icons.star, "Type", session['typeSession'] ?? 'N/A'),
                         _infoRow(Icons.group, "Capacité", session['capacity']?.toString()),
-                        _infoRow(Icons.handshake, "Inscrits", session['nbrRegister']?.toString() ?? 'N/A'),
                       ],
                     ),
-                    const SizedBox(height: 8),
-                    Divider(color: theme.dividerColor, thickness: 1),
-                    const SizedBox(height: 8),
-                    Padding(
-                      padding: const EdgeInsets.symmetric(vertical: 8.0),
+                    const SizedBox(height: 2),
+                    Center(
                       child: Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
                         decoration: BoxDecoration(
-                          color: isDark ? const Color(0xFF1A003D).withOpacity(0.3) : Colors.transparent,
-                          borderRadius: BorderRadius.circular(8),
-                          border: isDark ? Border.all(color: Colors.white.withOpacity(0.2), width: 1) : null,
+                          gradient: LinearGradient(
+                            begin: Alignment.topLeft,
+                            end: Alignment.bottomRight,
+                            colors: isDark
+                                ? [
+                                    Colors.white.withOpacity(0.1),
+                                    Colors.white.withOpacity(0.04),
+                                  ]
+                                : [
+                                    Colors.white,
+                                    Colors.grey.shade50,
+                                  ],
                         ),
+                        borderRadius: BorderRadius.circular(24),
+                        boxShadow: [
+                          BoxShadow(
+                            color: Colors.black.withOpacity(isDark ? 0.3 : 0.08),
+                            blurRadius: 8,
+                            offset: const Offset(0, 2),
+                          ),
+                        ],
+                      ),
                         child: Row(
-                          mainAxisAlignment: MainAxisAlignment.center,
+                          mainAxisSize: MainAxisSize.min,
                           children: [
-                            Icon(
-                              Icons.location_on,
-                              size: 16,
-                              color: isDark ? Colors.white70 : theme.iconTheme.color,
+                            Container(
+                              padding: const EdgeInsets.all(6),
+                              decoration: BoxDecoration(
+                                color: theme.primaryColor.withOpacity(0.2),
+                                shape: BoxShape.circle,
+                              ),
+                              child: Icon(
+                                Icons.location_on_rounded,
+                                size: 18,
+                                color: isDark ? Colors.white : theme.primaryColor,
+                              ),
                             ),
-                            const SizedBox(width: 4),
+                            const SizedBox(width: 10),
                             Text(
-                              'Local: ${selectedLocales[session['id']] ?? 'Non sélectionné'}',
+                              'Local: ${selectedLocales[session['id']]?.toString() ?? 'Non sélectionné'}',
                               style: theme.textTheme.bodyMedium?.copyWith(
                                 fontFamily: GoogleFonts.poppins().fontFamily,
                                 fontWeight: FontWeight.w600,
-                                color: isDark ? Colors.white70 : theme.textTheme.bodyMedium?.color,
+                                color: isDark ? Colors.white : theme.textTheme.bodyLarge?.color,
+                                letterSpacing: 0.2,
                               ) ??
                                   TextStyle(
                                     fontSize: 14,
                                     fontFamily: GoogleFonts.poppins().fontFamily,
                                     fontWeight: FontWeight.w600,
-                                    color: isDark ? Colors.white70 : Colors.black87,
+                                    color: isDark ? Colors.white : Colors.black87,
+                                    letterSpacing: 0.2,
                                   ),
                             ),
                           ],
                         ),
                       ),
                     ),
+                    const SizedBox(height: 4),
+                    Divider(color: theme.dividerColor, thickness: 1),
+                    const SizedBox(height: 4),
                     Row(
                       mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                       children: [
@@ -2282,9 +2342,103 @@ class _SessionDetailPageState extends State<SessionDetailPage> {
                   ],
                 ),
               ),
-            );
-          }).toList(),
-        ),
+            ),
+                );
+              },
+            ),
+                if (widget.sessions.length > 1) ...[
+                  if (_currentPageIndex > 0)
+                    Positioned(
+                      left: 4,
+                      top: 0,
+                      bottom: 0,
+                      child: Center(
+                        child: GestureDetector(
+                          onTap: () => _pageController.previousPage(
+                            duration: const Duration(milliseconds: 300),
+                            curve: Curves.easeInOut,
+                          ),
+                          child: Container(
+                            padding: const EdgeInsets.all(4),
+                            decoration: BoxDecoration(
+                              color: theme.cardColor.withOpacity(0.9),
+                              shape: BoxShape.circle,
+                              boxShadow: [
+                                BoxShadow(
+                                  color: Colors.black.withOpacity(0.15),
+                                  blurRadius: 4,
+                                  offset: const Offset(0, 2),
+                                ),
+                              ],
+                            ),
+                            child: Icon(
+                              Icons.chevron_left,
+                              size: 20,
+                              color: theme.primaryColor,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  if (_currentPageIndex < widget.sessions.length - 1)
+                    Positioned(
+                      right: 4,
+                      top: 0,
+                      bottom: 0,
+                      child: Center(
+                        child: GestureDetector(
+                          onTap: () => _pageController.nextPage(
+                            duration: const Duration(milliseconds: 300),
+                            curve: Curves.easeInOut,
+                          ),
+                          child: Container(
+                            padding: const EdgeInsets.all(4),
+                            decoration: BoxDecoration(
+                              color: theme.cardColor.withOpacity(0.9),
+                              shape: BoxShape.circle,
+                              boxShadow: [
+                                BoxShadow(
+                                  color: Colors.black.withOpacity(0.15),
+                                  blurRadius: 4,
+                                  offset: const Offset(0, 2),
+                                ),
+                              ],
+                            ),
+                            child: Icon(
+                              Icons.chevron_right,
+                              size: 20,
+                              color: theme.primaryColor,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                ],
+              ],
+            ),
+          ),
+          if (widget.sessions.length > 1)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 16),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: List.generate(widget.sessions.length, (index) {
+                  return AnimatedContainer(
+                    duration: const Duration(milliseconds: 200),
+                    margin: const EdgeInsets.symmetric(horizontal: 4),
+                    width: _currentPageIndex == index ? 10 : 8,
+                    height: 8,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: _currentPageIndex == index
+                          ? theme.primaryColor
+                          : theme.primaryColor.withOpacity(0.3),
+                    ),
+                  );
+                }),
+              ),
+            ),
+        ],
       ),
     );
   }

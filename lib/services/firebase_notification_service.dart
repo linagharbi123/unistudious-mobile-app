@@ -1,13 +1,31 @@
-
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'dart:io' show Platform;
 import 'package:http/http.dart' as http;
 import 'dart:convert';
+import 'package:permission_handler/permission_handler.dart';
 
 class FirebaseNotificationService {
   static final FirebaseMessaging _messaging = FirebaseMessaging.instance;
   static String? _lastSavedToken;
+  static const _iosNotificationChannel = MethodChannel('com.unistudious.projet1v2/notifications');
+
+  /// Sur iOS : force l'enregistrement pour les notifications à distance (APNs).
+  /// À appeler après que l'utilisateur ait accordé la permission.
+  static Future<void> _registerForRemoteNotificationsIOS() async {
+    if (!Platform.isIOS) return;
+    try {
+      await _iosNotificationChannel.invokeMethod('registerForRemoteNotifications');
+      if (kDebugMode) {
+        print('✅ registerForRemoteNotifications invoqué côté natif iOS');
+      }
+    } catch (e) {
+      if (kDebugMode) {
+        print('⚠️ Erreur registerForRemoteNotifications iOS: $e');
+      }
+    }
+  }
 
   /// Gets the FCM token for the current device
   /// Returns null if token cannot be retrieved
@@ -34,6 +52,9 @@ class FirebaseNotificationService {
           if (kDebugMode) {
             print('✅ Permissions iOS accordées');
           }
+          await _registerForRemoteNotificationsIOS();
+          // Petit délai pour laisser iOS transmettre le token APNs à Firebase
+          await Future.delayed(const Duration(milliseconds: 500));
         } else {
           if (kDebugMode) {
             print('⚠️ Permissions iOS refusées: ${settings.authorizationStatus}');
@@ -62,6 +83,69 @@ class FirebaseNotificationService {
         print('❌ Erreur lors de la récupération du token FCM: $e');
       }
       return null;
+    }
+  }
+
+  /// Vérifie si les notifications sont activées sur l'appareil.
+  /// Sur Android < 13, les notifications sont activées par défaut.
+  static Future<bool> isNotificationPermissionGranted() async {
+    try {
+      if (Platform.isIOS) {
+        final settings = await _messaging.getNotificationSettings();
+        return settings.authorizationStatus == AuthorizationStatus.authorized ||
+            settings.authorizationStatus == AuthorizationStatus.provisional;
+      } else if (Platform.isAndroid) {
+        // Android 13+ (API 33) requiert la permission POST_NOTIFICATIONS
+        final status = await Permission.notification.status;
+        return status.isGranted;
+      }
+      return true;
+    } catch (e) {
+      if (kDebugMode) {
+        print('❌ Erreur vérification permission notifications: $e');
+      }
+      return false;
+    }
+  }
+
+  /// Demande la permission d'afficher les notifications.
+  /// Sur iOS : dialogue natif de l'OS.
+  /// Sur Android 13+ : dialogue natif POST_NOTIFICATIONS.
+  /// Sur Android < 13 : retourne true car pas de permission requise.
+  static Future<bool> requestNotificationPermission() async {
+    try {
+      if (Platform.isIOS) {
+        final settings = await _messaging.requestPermission(
+          alert: true,
+          announcement: false,
+          badge: true,
+          carPlay: false,
+          criticalAlert: false,
+          provisional: false,
+          sound: true,
+        );
+        final granted = settings.authorizationStatus == AuthorizationStatus.authorized ||
+            settings.authorizationStatus == AuthorizationStatus.provisional;
+        if (kDebugMode) {
+          print('🔔 Permission iOS: ${settings.authorizationStatus}');
+        }
+        if (granted) {
+          await _registerForRemoteNotificationsIOS();
+        }
+        return granted;
+      } else if (Platform.isAndroid) {
+        final status = await Permission.notification.request();
+        if (kDebugMode) {
+          print('🔔 Permission Android: $status');
+        }
+        return status.isGranted;
+      }
+      return true;
+    } catch (e) {
+      if (kDebugMode) {
+        print('❌ Erreur demande permission notifications: $e');
+      }
+      return false;
     }
   }
 

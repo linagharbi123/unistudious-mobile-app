@@ -6,6 +6,7 @@ import 'dart:io';
 import '../models/user_model.dart';
 import '../providers/theme_provider.dart';
 import '../utils/snackbar_helper.dart';
+import '../utils/action_guard.dart';
 import 'apple_login_page.dart';
 
 class SignUpPage extends StatefulWidget {
@@ -27,77 +28,81 @@ class _SignUpPageState extends State<SignUpPage> {
   bool _isTermsAccepted = false;
 
   Future<void> _signUp() async {
-    if (!_formKey.currentState!.validate()) return;
+    if (_isLoading) return;
 
-    // Vérifier la confirmation du mot de passe
-    if (_passwordController.text != _confirmPasswordController.text) {
-      SnackBarHelper.showError(context, 'Les mots de passe ne correspondent pas');
-      return;
-    }
+    await ActionGuard.instance.run('signup', () async {
+      if (!_formKey.currentState!.validate()) return;
 
-    if (!_isTermsAccepted) {
-      SnackBarHelper.showWarning(context, 'Veuillez accepter les conditions d\'utilisation');
-      return;
-    }
+      // Vérifier la confirmation du mot de passe
+      if (_passwordController.text != _confirmPasswordController.text) {
+        SnackBarHelper.showError(context, 'Les mots de passe ne correspondent pas');
+        return;
+      }
 
-    setState(() => _isLoading = true);
+      if (!_isTermsAccepted) {
+        SnackBarHelper.showWarning(context, 'Veuillez accepter les conditions d\'utilisation');
+        return;
+      }
 
-    final url = Uri.parse('https://www.unistudious.com/register-mobile');
+      setState(() => _isLoading = true);
 
-    try {
-      final response = await http.post(
-        url,
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json',
-        },
-        body: jsonEncode({
-          'full_name': _fullNameController.text.trim(),
-          'username': _usernameController.text.trim(),
-          'email': _emailController.text.trim().toLowerCase(),
-          'password': _passwordController.text,
-          'phone_number': _phoneController.text.trim(),
-          'location': null,
-        }),
-      );
+      final url = Uri.parse('https://www.unistudious.com/register-mobile');
 
-      if (response.statusCode == 200 || response.statusCode == 201) {
-        final data = jsonDecode(response.body);
+      try {
+        final response = await http.post(
+          url,
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+          },
+          body: jsonEncode({
+            'full_name': _fullNameController.text.trim(),
+            'username': _usernameController.text.trim(),
+            'email': _emailController.text.trim().toLowerCase(),
+            'password': _passwordController.text,
+            'phone_number': _phoneController.text.trim(),
+            'location': null,
+          }),
+        );
 
-        // Mettre à jour le modèle utilisateur si disponible
-        if (data['user'] != null) {
-          Provider.of<UserModel>(context, listen: false).name =
-              data['user']['full_name'] ?? _fullNameController.text;
-          Provider.of<UserModel>(context, listen: false).email =
-              data['user']['email'] ?? _emailController.text;
-          Provider.of<UserModel>(context, listen: false).username =
-              data['user']['username'] ?? _usernameController.text;
+        if (response.statusCode == 200 || response.statusCode == 201) {
+          final data = jsonDecode(response.body);
+
+          // Mettre à jour le modèle utilisateur si disponible
+          if (data['user'] != null) {
+            Provider.of<UserModel>(context, listen: false).name =
+                data['user']['full_name'] ?? _fullNameController.text;
+            Provider.of<UserModel>(context, listen: false).email =
+                data['user']['email'] ?? _emailController.text;
+            Provider.of<UserModel>(context, listen: false).username =
+                data['user']['username'] ?? _usernameController.text;
+          }
+
+          if (mounted) {
+            SnackBarHelper.showSuccess(context, data['message'] ?? 'Inscription réussie !');
+            Navigator.pushNamedAndRemoveUntil(
+                context, '/dashboard', (route) => false);
+          }
+        } else {
+          final errorData = jsonDecode(response.body);
+          final errorMessage = errorData['message'] ??
+              errorData['error'] ??
+              'Échec de l\'inscription';
+
+          if (mounted) {
+            SnackBarHelper.showError(context, errorMessage);
+          }
         }
-
+      } catch (e) {
         if (mounted) {
-          SnackBarHelper.showSuccess(context, data['message'] ?? 'Inscription réussie !');
-          Navigator.pushNamedAndRemoveUntil(
-              context, '/dashboard', (route) => false);
+          SnackBarHelper.showError(context, 'Erreur de connexion');
         }
-      } else {
-        final errorData = jsonDecode(response.body);
-        final errorMessage = errorData['message'] ??
-            errorData['error'] ??
-            'Échec de l\'inscription';
-
+      } finally {
         if (mounted) {
-          SnackBarHelper.showError(context, errorMessage);
+          setState(() => _isLoading = false);
         }
       }
-    } catch (e) {
-      if (mounted) {
-        SnackBarHelper.showError(context, 'Erreur de connexion: ${e.toString()}');
-      }
-    } finally {
-      if (mounted) {
-        setState(() => _isLoading = false);
-      }
-    }
+    });
   }
 
   String? _validatePhone(String? value) {
@@ -412,7 +417,7 @@ class _SignUpPageState extends State<SignUpPage> {
 
                   // Bouton d'inscription
                   _buildElevatedButton(
-                    onPressed: _signUp,
+                    onPressed: _signUp.guarded,
                     label: 'S\'inscrire',
                     icon: Icons.person_add,
                   ),

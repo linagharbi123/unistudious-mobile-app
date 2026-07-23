@@ -168,7 +168,7 @@ class _ForgetPasswordPageState extends State<ForgetPasswordPage> {
             color: isDark ? null : Colors.white,
             gradient: isDark
                 ? const LinearGradient(
-              colors: [Color(0xFF1A003D), Color(0xFF3C0D73)],
+              colors: [Color(0xFF6A65F7), Color(0xFF4D46DB)],
               begin: Alignment.topLeft,
               end: Alignment.bottomRight,
             )
@@ -421,7 +421,7 @@ class _VerificationCodePageState extends State<VerificationCodePage> {
             color: isDark ? null : Colors.white,
             gradient: isDark
                 ? const LinearGradient(
-              colors: [Color(0xFF1A003D), Color(0xFF3C0D73)],
+              colors: [Color(0xFF6A65F7), Color(0xFF4D46DB)],
               begin: Alignment.topLeft,
               end: Alignment.bottomRight,
             )
@@ -686,7 +686,7 @@ class _ResetPasswordPageState extends State<ResetPasswordPage> {
             color: isDark ? null : Colors.white,
             gradient: isDark
                 ? const LinearGradient(
-              colors: [Color(0xFF1A003D), Color(0xFF3C0D73)],
+              colors: [Color(0xFF6A65F7), Color(0xFF4D46DB)],
               begin: Alignment.topLeft,
               end: Alignment.bottomRight,
             )

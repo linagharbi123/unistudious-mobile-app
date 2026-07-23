@@ -20,6 +20,7 @@ import 'statistics_page.dart';
 import 'profile_posts_pins_page.dart';
 import 'settings_page.dart';
 import '../utils/connection_checker.dart';
+import '../services/page_cache_service.dart';
 
 
 class ProfilePageBottomNav extends StatefulWidget {
@@ -42,6 +43,7 @@ class _ProfilPageBottomNavState extends State<ProfilePageBottomNav> {
   List<Map<String, dynamic>> _sessions = [];
   String? _errorMessage;
   bool isConnectionError = false;
+  bool isLoading = true;
   Timer? _connectionCheckTimer;
 
   final List<Color> themeColors = [
@@ -82,9 +84,6 @@ class _ProfilPageBottomNavState extends State<ProfilePageBottomNav> {
             setState(() {
               isConnectionError = false;
             });
-            // Utiliser directement _fetchProfileData avec gestion du loading
-            final loadingProvider = Provider.of<LoadingProvider>(context, listen: false);
-            loadingProvider.showLoading();
             _fetchProfileData();
           }
         });
@@ -92,13 +91,43 @@ class _ProfilPageBottomNavState extends State<ProfilePageBottomNav> {
     });
   }
 
+  Future<void> _loadFromCache() async {
+    final authProvider = Provider.of<AuthProvider>(context, listen: false);
+    final cached = await PageCacheService.load(
+      'profile',
+      userToken: authProvider.currentToken,
+    );
+    if (cached == null || !mounted) return;
+
+    setState(() {
+      _fullName = cached['fullName'] as String?;
+      _email = cached['email'] as String?;
+      _aboutMe = cached['aboutMe'] as String?;
+      _coursesFollowed = (cached['coursesFollowed'] as num?)?.toInt();
+      _progress = (cached['progress'] as num?)?.toDouble();
+      _badgesEarned = (cached['badgesEarned'] as num?)?.toInt();
+      _studyHours = (cached['studyHours'] as num?)?.toInt();
+      _badges = (cached['badges'] as Map?)?.map(
+            (k, v) => MapEntry(k.toString(), Map<String, dynamic>.from(v as Map)),
+          ) ??
+          {};
+      _sessions = (cached['sessions'] as List?)
+              ?.map((s) => Map<String, dynamic>.from(s as Map))
+              .toList() ??
+          [];
+      _imageUrl = cached['imageUrl'] as String?;
+      _errorMessage = null;
+      isLoading = false;
+    });
+  }
+
   Future<void> _checkAuthAndFetchData() async {
     final authProvider = Provider.of<AuthProvider>(context, listen: false);
-    final loadingProvider = Provider.of<LoadingProvider>(context, listen: false);
 
     try {
       setState(() {
         isConnectionError = false;
+        isLoading = true;
       });
 
       if (!authProvider.isLoggedIn) {
@@ -107,8 +136,10 @@ class _ProfilPageBottomNavState extends State<ProfilePageBottomNav> {
         return;
       }
 
-      loadingProvider.showLoading();
-      await Future.delayed(const Duration(milliseconds: 300));
+      await _loadFromCache();
+      if (mounted && _fullName == null) {
+        setState(() => isLoading = true);
+      }
       await _fetchProfileData();
     } catch (e) {
       if (mounted) {
@@ -134,7 +165,7 @@ class _ProfilPageBottomNavState extends State<ProfilePageBottomNav> {
         });
       }
     } finally {
-      loadingProvider.hideLoading();
+      if (mounted) setState(() => isLoading = false);
     }
   }
 
@@ -231,68 +262,46 @@ class _ProfilPageBottomNavState extends State<ProfilePageBottomNav> {
 
   Future<void> _fetchProfileData() async {
     final authProvider = Provider.of<AuthProvider>(context, listen: false);
-    final loadingProvider = Provider.of<LoadingProvider>(context, listen: false);
 
     setState(() {
       isConnectionError = false;
     });
 
     if (!authProvider.isLoggedIn) {
-      loadingProvider.hideLoading();
       Navigator.pushReplacementNamed(context, '/login');
       return;
     }
 
     try {
-      final profileResponse = await authProvider.authenticatedRequest(
-        'GET',
-        '/api/my-profile',
-      );
-
-      final socialMediaResponse = await authProvider.authenticatedRequest(
-        'GET',
-        '/api/profile-social-media',
-      );
+      final responses = await Future.wait([
+        authProvider.authenticatedRequest('GET', '/api/my-profile'),
+        authProvider.authenticatedRequest('GET', '/api/profile-social-media'),
+      ]);
+      final profileResponse = responses[0];
+      final socialMediaResponse = responses[1];
 
       if (profileResponse.statusCode == 200) {
         final jsonResponse = jsonDecode(profileResponse.body);
         final data = jsonResponse['data_profile'] ?? {};
 
-        final badges = <String, Map<String, dynamic>>{};
         final badgeList = data['badge'] as List<dynamic>? ?? [];
+        final badges = <String, Map<String, dynamic>>{};
         for (var badge in badgeList) {
           final name = badge['name'] as String? ?? '';
-          final imageFilename = badge['image'] as String? ?? '';
-          String? badgeImageUrl;
-          if (imageFilename.isNotEmpty) {
-            badgeImageUrl = await _fetchBadgeImage(imageFilename);
-          }
           badges[name] = {
             'count': badge['count'] as int? ?? 0,
-            'image': badgeImageUrl,
+            'image': null,
+            '_imageFile': badge['image'] as String? ?? '',
           };
         }
 
-        final sessions = <Map<String, dynamic>>[];
         final sessionList = data['sessions'] as List<dynamic>? ?? [];
-        for (var session in sessionList) {
-          final imageFilename = session['imgLink'] as String? ?? '';
-          String? sessionImageUrl;
-          if (imageFilename.isNotEmpty) {
-            sessionImageUrl = await _fetchSessionImage(imageFilename);
-          }
-          sessions.add({
-            'name': session['name'] as String? ?? '',
-            'accountName': session['accountName'] as String? ?? '',
-            'image': sessionImageUrl,
-          });
-        }
-
-        final profileImageFilename = data['url_image'] as String? ?? '';
-        String? profileImageUrl;
-        if (profileImageFilename.isNotEmpty) {
-          profileImageUrl = await _fetchProfileImage(profileImageFilename);
-        }
+        final sessions = sessionList.map<Map<String, dynamic>>((session) => {
+          'name': session['name'] as String? ?? '',
+          'accountName': session['accountName'] as String? ?? '',
+          'image': null,
+          '_imageFile': session['imgLink'] as String? ?? '',
+        }).toList();
 
         String? socialMediaAboutMe;
         if (socialMediaResponse.statusCode == 200) {
@@ -303,10 +312,9 @@ class _ProfilPageBottomNavState extends State<ProfilePageBottomNav> {
           socialMediaAboutMe = document.body?.text.trim() ?? 'Aucune description disponible';
         } else {
           socialMediaAboutMe = 'Aucune description disponible';
-          if (mounted) {
-            SnackBarHelper.showError(context, 'Erreur données sociales : ${socialMediaResponse.statusCode}');
-          }
         }
+
+        final profileImageFilename = data['url_image'] as String? ?? '';
 
         if (mounted) {
           setState(() {
@@ -322,12 +330,46 @@ class _ProfilPageBottomNavState extends State<ProfilePageBottomNav> {
             ) ?? 0;
             _badges = badges;
             _sessions = sessions;
-            _imageUrl = profileImageUrl;
+            _imageUrl = null;
             _errorMessage = null;
-            isConnectionError = false; // S'assurer que isConnectionError est false quand les données sont chargées
+            isConnectionError = false;
+            isLoading = false;
           });
-          developer.log('Profile data loaded successfully: $_fullName, $_email', name: 'ProfilePage');
         }
+
+        // Images en parallèle en arrière-plan
+        _loadProfileImagesInBackground(
+          profileImageFilename: profileImageFilename,
+          badges: badges,
+          sessions: sessions,
+        );
+
+        await PageCacheService.save(
+          'profile',
+          {
+            'fullName': _fullName,
+            'email': _email,
+            'aboutMe': socialMediaAboutMe,
+            'coursesFollowed': data['total_course'] as int? ?? 0,
+            'progress': (data['statistics']?['personAttendancePercentage'] as num?)?.toDouble() ?? 0.0,
+            'badgesEarned': data['total_tag_assignments'] as int? ?? 0,
+            'studyHours': (data['courses'] as List<dynamic>?)?.fold<int>(
+                  0, (sum, course) => sum + ((course['nbHours'] as num?)?.toInt() ?? 0),
+                ) ??
+                0,
+            'badges': badges.map((k, v) => MapEntry(k, {
+                  'count': v['count'],
+                  'image': v['image'],
+                })),
+            'sessions': sessions.map((s) => {
+                  'name': s['name'],
+                  'accountName': s['accountName'],
+                  'image': s['image'],
+                }).toList(),
+            'imageUrl': _imageUrl,
+          },
+          userToken: authProvider.currentToken,
+        );
       } else {
         String errorMessage;
         if (profileResponse.statusCode == 405) {
@@ -370,11 +412,51 @@ class _ProfilPageBottomNavState extends State<ProfilePageBottomNav> {
         });
       }
     } finally {
-      // Toujours masquer le loading à la fin, même en cas d'erreur
-      if (mounted) {
-        loadingProvider.hideLoading();
-      }
+      if (mounted) setState(() => isLoading = false);
     }
+  }
+
+  Future<void> _loadProfileImagesInBackground({
+    required String profileImageFilename,
+    required Map<String, Map<String, dynamic>> badges,
+    required List<Map<String, dynamic>> sessions,
+  }) async {
+    final futures = <Future<void>>[];
+
+    if (profileImageFilename.isNotEmpty) {
+      futures.add(_fetchProfileImage(profileImageFilename).then((url) {
+        if (mounted && url != null) setState(() => _imageUrl = url);
+      }));
+    }
+
+    for (final entry in badges.entries) {
+      final filename = entry.value['_imageFile'] as String? ?? '';
+      if (filename.isEmpty) continue;
+      final name = entry.key;
+      futures.add(_fetchBadgeImage(filename).then((url) {
+        if (!mounted || url == null) return;
+        setState(() {
+          _badges[name] = {..._badges[name]!, 'image': url};
+        });
+      }));
+    }
+
+    for (int i = 0; i < sessions.length; i++) {
+      final filename = sessions[i]['_imageFile'] as String? ?? '';
+      if (filename.isEmpty) continue;
+      futures.add(_fetchSessionImage(filename).then((url) {
+        if (!mounted || url == null) return;
+        setState(() {
+          if (i < _sessions.length) {
+            final updated = Map<String, dynamic>.from(_sessions[i]);
+            updated['image'] = url;
+            _sessions[i] = updated;
+          }
+        });
+      }));
+    }
+
+    await Future.wait(futures);
   }
 
   Future<void> _pickAndUploadProfileImage() async {
@@ -444,46 +526,39 @@ class _ProfilPageBottomNavState extends State<ProfilePageBottomNav> {
 
     return LoadingWrapper(
       child: Scaffold(
-        body: Consumer<LoadingProvider>(
-          builder: (context, loadingProvider, child) {
-            if (loadingProvider.isLoading) {
-              return const Center(child: CircularProgressIndicator());
-            }
-            if (isConnectionError) {
-              return _buildConnectionErrorWidget(theme);
-            }
-            if (_errorMessage != null) {
-              return _buildErrorWidget(theme);
-            }
-            return RefreshIndicator(
-              onRefresh: _fetchProfileData,
-              child: SingleChildScrollView(
-                physics: const AlwaysScrollableScrollPhysics(),
-                child: Padding(
-                  padding: const EdgeInsets.all(16.0),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      _buildProfileCard(theme, isDark),
-                      const SizedBox(height: 24),
-                      _buildStatsCard(theme),
-                      const SizedBox(height: 24),
-                      _buildSectionTitle('Mes Badges', theme),
-                      const SizedBox(height: 16),
-                      _buildBadgesSection(theme),
-                      const SizedBox(height: 24),
-                      _buildSectionTitle('Mes Sessions', theme),
-                      const SizedBox(height: 16),
-                      _buildSessionsSection(theme),
-                      const SizedBox(height: 24),
-                      _buildActionTiles(theme),
-                    ],
-                  ),
-                ),
-              ),
-            );
-          },
-        ),
+        body: isLoading
+            ? const Center(child: CircularProgressIndicator())
+            : isConnectionError
+                ? _buildConnectionErrorWidget(theme)
+                : _errorMessage != null
+                    ? _buildErrorWidget(theme)
+                    : RefreshIndicator(
+                        onRefresh: _fetchProfileData,
+                        child: SingleChildScrollView(
+                          physics: const AlwaysScrollableScrollPhysics(),
+                          child: Padding(
+                            padding: const EdgeInsets.all(16.0),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.stretch,
+                              children: [
+                                _buildProfileCard(theme, isDark),
+                                const SizedBox(height: 24),
+                                _buildStatsCard(theme),
+                                const SizedBox(height: 24),
+                                _buildSectionTitle('Mes Badges', theme),
+                                const SizedBox(height: 16),
+                                _buildBadgesSection(theme),
+                                const SizedBox(height: 24),
+                                _buildSectionTitle('Mes Sessions', theme),
+                                const SizedBox(height: 16),
+                                _buildSessionsSection(theme),
+                                const SizedBox(height: 24),
+                                _buildActionTiles(theme),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
       ),
     );
   }

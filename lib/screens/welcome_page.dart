@@ -65,8 +65,8 @@ class _WelcomePageState extends State<WelcomePage>
         decoration: BoxDecoration(
           gradient: LinearGradient(
             colors: isDark
-                ? const [Color(0xFF1A003D), Color(0xFF3C0D73)] // Dark mode gradient
-                : const [Color(0xFF8E2DE2), Color(0xFF4A00E0)], // Light mode gradient
+                ? const [Color(0xFF6A65F7), Color(0xFF4D46DB)] // Dark mode gradient
+                : const [Color(0xFF6A65F7), Color(0xFF4D46DB)], // Light mode gradient
             begin: Alignment.topLeft,
             end: Alignment.bottomRight,
           ),

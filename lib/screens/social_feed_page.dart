@@ -19,6 +19,7 @@ import 'package:url_launcher/url_launcher.dart';
 import 'package:flutter/gestures.dart';
 import 'dart:async';
 import '../utils/connection_checker.dart';
+import '../services/page_cache_service.dart';
 
 class ReactionButton extends StatefulWidget {
   final String postId;
@@ -268,7 +269,7 @@ class ReactionSheet extends StatelessWidget {
         borderRadius: const BorderRadius.vertical(top: Radius.circular(20)),
       ),
       child: Column(
-        mainAxisSize: MainAxisSize.min,
+        mainAxisSize: MainAxisSize.max,
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
@@ -323,24 +324,24 @@ class ReactionSheet extends StatelessWidget {
                 shrinkWrap: true,
                 itemCount: emojiList.length,
                 itemBuilder: (context, index) {
-                  final emoji = emojiList[index].key;
-                  final count = emojiList[index].value;
-                  return ListTile(
-                    leading: Text(
-                      emoji,
-                      style: const TextStyle(fontSize: 24),
-                    ),
-                    title: Text(
-                      '$count réaction${count > 1 ? 's' : ''}',
-                      style: theme.textTheme.bodyLarge?.copyWith(
-                        fontFamily: GoogleFonts.poppins().fontFamily,
-                        fontSize: 16,
-                      ) ??
-                          TextStyle(
-                            fontFamily: GoogleFonts.poppins().fontFamily,
-                            fontSize: 16,
-                            color: theme.textTheme.bodyLarge?.color,
-                          ),
+                    final emoji = emojiList[index].key;
+                    final count = emojiList[index].value;
+                    return ListTile(
+                      leading: Text(
+                        emoji,
+                        style: const TextStyle(fontSize: 24),
+                      ),
+                      title: Text(
+                        '$count réaction${count > 1 ? 's' : ''}',
+                        style: theme.textTheme.bodyLarge?.copyWith(
+                          fontFamily: GoogleFonts.poppins().fontFamily,
+                          fontSize: 16,
+                        ) ??
+                            TextStyle(
+                              fontFamily: GoogleFonts.poppins().fontFamily,
+                              fontSize: 16,
+                              color: theme.textTheme.bodyLarge?.color,
+                            ),
                     ),
                   );
                 },
@@ -691,7 +692,34 @@ class _SocialFeedPageState extends State<SocialFeedPage> {
       return;
     }
 
+    await _loadFromCache();
     await _fetchSocialFeed(page: 1);
+  }
+
+  Future<void> _loadFromCache() async {
+    final authProvider = Provider.of<AuthProvider>(context, listen: false);
+    final cached = await PageCacheService.load(
+      'social_feed',
+      userToken: authProvider.currentToken,
+      maxAge: const Duration(minutes: 30),
+    );
+    if (cached == null || !mounted) return;
+
+    final cachedPosts = cached['posts'];
+    if (cachedPosts is! List || cachedPosts.isEmpty) return;
+
+    setState(() {
+      posts = cachedPosts
+          .map((p) => Map<String, dynamic>.from(p as Map))
+          .toList();
+      _finalUsername = cached['finalUsername'] as String?;
+      _currentUserId = cached['currentUserId'] as String?;
+      targetUserId = cached['targetUserId'] as String?;
+      currentPage = (cached['currentPage'] as num?)?.toInt() ?? 1;
+      totalPages = (cached['totalPages'] as num?)?.toInt() ?? 1;
+      isLoading = false;
+      isConnectionError = false;
+    });
   }
 
   Future<List<Map<String, dynamic>>> _fetchComments(String postId) async {
@@ -834,6 +862,62 @@ class _SocialFeedPageState extends State<SocialFeedPage> {
     }
   }
 
+  /// Charge commentaires et réactions en parallèle après affichage des posts
+  void _enrichPostsInBackground(
+    List<Map<String, dynamic>> newPosts,
+    String currentUserIdForSession,
+    Map<String, String> userReactions,
+  ) {
+    for (final post in newPosts) {
+      final postId = post['id']?.toString() ?? '';
+      if (postId.isEmpty) continue;
+
+      Future.wait([
+        _fetchComments(postId),
+        _fetchReactions(postId),
+      ]).then((results) {
+        if (!mounted) return;
+        final commentList = results[0];
+        final reactionList = results[1];
+
+        final postReactions = <String, String>{};
+        for (var reaction in reactionList) {
+          final uid = reaction['user']['id'];
+          final emoji = reaction['emoji'];
+          postReactions[uid] = emoji;
+        }
+        final userReaction = post['userReaction'];
+        if (userReaction != null && currentUserIdForSession.isNotEmpty) {
+          postReactions[currentUserIdForSession] = userReaction;
+        }
+
+        setState(() {
+          final idx = posts.indexWhere((p) => p['id'] == postId);
+          if (idx == -1) return;
+          posts[idx] = {
+            ...posts[idx],
+            'comments': commentList,
+            'commentCount': commentList.isNotEmpty ? commentList.length : posts[idx]['commentCount'],
+            'reactions': reactionList,
+            'userReactions': postReactions,
+          };
+        });
+      }).catchError((_) {});
+
+      // Résoudre userId manquant en arrière-plan
+      final pendingUsername = post['_pendingUsername']?.toString();
+      if ((post['userId']?.toString().isEmpty ?? true) && pendingUsername != null) {
+        _fetchUserIdByUsername(pendingUsername).then((uid) {
+          if (!mounted || uid == null) return;
+          setState(() {
+            final idx = posts.indexWhere((p) => p['id'] == postId);
+            if (idx != -1) posts[idx] = {...posts[idx], 'userId': uid};
+          });
+        });
+      }
+    }
+  }
+
   Future<void> _fetchSocialFeed({required int page}) async {
     final authProvider = Provider.of<AuthProvider>(context, listen: false);
     String? fetchedTargetUserId;
@@ -939,9 +1023,6 @@ class _SocialFeedPageState extends State<SocialFeedPage> {
                 : account['username']?.toString() ?? 'Unknown User';
             profileUrl = account['avatar']?.toString() ?? '';
             userId = account['id']?.toString() ?? '';
-            if (userId.isEmpty && account['username'] != null) {
-              userId = await _fetchUserIdByUsername(account['username']) ?? '';
-            }
           }
 
           String text = _stripHtml(statusData['content'] ?? '');
@@ -953,25 +1034,17 @@ class _SocialFeedPageState extends State<SocialFeedPage> {
           String timeAgo = _timeAgo(DateTime.parse(
               statusData['created_at'] ?? DateTime.now().toIso8601String()));
           int likes = statusData['favourites_count'] ?? 0;
-          int commentCount = statusData['replies_count'] ?? 0;
+          final commentCount = statusData['replies_count'] ?? 0;
           int shares = statusData['reblogs_count'] ?? 0;
           dynamic poll = statusData['poll'];
           bool favourited = statusData['favourited'] ?? false;
           bool pinned = statusData['pinned'] ?? false;
 
-          final commentList = await _fetchComments(statusData['id'] ?? '');
-          final reactionList = await _fetchReactions(statusData['id'] ?? '');
-
-          final postReactions = <String, String>{};
-          for (var reaction in reactionList) {
-            final userId = reaction['user']['id'];
-            final emoji = reaction['emoji'];
-            postReactions[userId] = emoji;
-          }
           final userReaction = status['userReaction'] ??
               userReactions[statusData['id']] ??
               null;
 
+          final postReactions = <String, String>{};
           if (userReaction != null && currentUserIdForSession.isNotEmpty) {
             postReactions[currentUserIdForSession] = userReaction;
           }
@@ -984,17 +1057,18 @@ class _SocialFeedPageState extends State<SocialFeedPage> {
             "text": text,
             "imageUrl": imageUrl,
             "likes": likes,
-            "comments": commentList,
-            "commentCount": commentList.length,
+            "comments": <Map<String, dynamic>>[],
+            "commentCount": commentCount,
             "shares": shares,
             "profileUrl": profileUrl,
             "poll": poll,
             "favourited": favourited,
             "userReactions": postReactions,
-            "reactions": reactionList,
+            "reactions": <Map<String, dynamic>>[],
             "apiReactions": status['reactions'] ?? {"total": 0, "byEmoji": {}},
             "userReaction": userReaction,
             "pinned": pinned,
+            "_pendingUsername": account?['username'], // enrichissement différé
           });
         }
 
@@ -1014,6 +1088,24 @@ class _SocialFeedPageState extends State<SocialFeedPage> {
           this.targetUserId =
               fetchedTargetUserId ?? this.targetUserId ?? currentUserIdForSession;
         });
+
+        // Charger commentaires/réactions en arrière-plan (évite N×2 appels API bloquants)
+        _enrichPostsInBackground(mappedPosts, currentUserIdForSession, userReactions);
+
+        if (page == 1) {
+          await PageCacheService.save(
+            'social_feed',
+            {
+              'posts': posts,
+              'finalUsername': _finalUsername,
+              'currentUserId': _currentUserId,
+              'targetUserId': targetUserId,
+              'currentPage': currentPage,
+              'totalPages': totalPages,
+            },
+            userToken: authProvider.currentToken,
+          );
+        }
       } else {
         setState(() {
           errorMessage = 'Failed to load feed: ${response.statusCode}';
@@ -1083,8 +1175,16 @@ class _SocialFeedPageState extends State<SocialFeedPage> {
   }
 
   String _stripHtml(String html) {
-    // D'abord, supprimer les balises HTML
-    String stripped = html.replaceAll(RegExp(r'<[^>]*>'), '').trim();
+    // Convertir les sauts de ligne HTML en \n avant de supprimer les balises
+    String stripped = html
+        .replaceAll(RegExp(r'<br\s*/?>', caseSensitive: false), '\n')
+        .replaceAll(RegExp(r'</p\s*>', caseSensitive: false), '\n')
+        .replaceAll(RegExp(r'</div\s*>', caseSensitive: false), '\n')
+        .replaceAll(RegExp(r'</li\s*>', caseSensitive: false), '\n')
+        .replaceAll(RegExp(r'<[^>]*>'), '')
+        .replaceAll(RegExp(r'[ \t]+\n'), '\n')
+        .replaceAll(RegExp(r'\n{3,}'), '\n\n')
+        .trim();
     // Ensuite, décoder les entités HTML pour afficher correctement les caractères < et >
     return _unescapeHtml(stripped);
   }
@@ -1108,12 +1208,18 @@ class _SocialFeedPageState extends State<SocialFeedPage> {
         String? statusId,
         bool removeImage = false,
       }) async {
+    if (isPosting) return;
+    isPosting = true;
+    if (mounted) setState(() {});
+
     // Le texte est envoyé tel quel, sans modification, pour préserver tous les caractères spéciaux
     if (status.isEmpty && image == null && (!enablePoll || pollOptions.isEmpty)) {
       developer.log(
           'Post status failed: status, image, and poll are empty',
           name: 'SocialFeedPage');
       SnackBarHelper.showWarning(context, 'Veuillez saisir un statut, ajouter une image ou activer un sondage.');
+      isPosting = false;
+      if (mounted) setState(() {});
       return;
     }
 
@@ -1121,6 +1227,8 @@ class _SocialFeedPageState extends State<SocialFeedPage> {
       developer.log('Post status failed: poll duration is missing',
           name: 'SocialFeedPage');
       SnackBarHelper.showWarning(context, 'Veuillez choisir une durée pour le sondage.');
+      isPosting = false;
+      if (mounted) setState(() {});
       return;
     }
 
@@ -1129,12 +1237,10 @@ class _SocialFeedPageState extends State<SocialFeedPage> {
       developer.log('No valid token available', name: 'SocialFeedPage');
       SnackBarHelper.showError(context, 'Session expirée. Veuillez vous reconnecter.');
       Navigator.pushReplacementNamed(context, '/login');
+      isPosting = false;
+      if (mounted) setState(() {});
       return;
     }
-
-    setState(() {
-      isPosting = true;
-    });
 
     final baseUrl = statusId != null
         ? 'https://www.unistudious.com/api/social-media-status-update'
@@ -1203,9 +1309,8 @@ class _SocialFeedPageState extends State<SocialFeedPage> {
       );
       SnackBarHelper.showError(context, 'Erreur lors de la ${statusId != null ? 'mise à jour' : 'publication'} : $e');
     } finally {
-      setState(() {
-        isPosting = false;
-      });
+      isPosting = false;
+      if (mounted) setState(() {});
     }
   }
 
@@ -2311,7 +2416,9 @@ class _SocialFeedPageState extends State<SocialFeedPage> {
                         : IconButton(
                       icon: Icon(Icons.send_rounded,
                           color: theme.primaryColor, size: 28),
-                      onPressed: () {
+                      onPressed: isPosting
+                          ? null
+                          : () {
                         final statusText = _statusController.text.trim();
                         if (statusText.isEmpty) {
                           SnackBarHelper.showWarning(context, 'Veuillez saisir un statut.');

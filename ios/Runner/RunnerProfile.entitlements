@@ -10,5 +10,10 @@
 	</array>
 	<key>keychain-access-groups</key>
 	<array/>
+	<key>com.apple.developer.associated-domains</key>
+	<array>
+		<string>applinks:unistudious.com</string>
+		<string>applinks:www.unistudious.com</string>
+	</array>
 </dict>
 </plist>

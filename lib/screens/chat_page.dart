@@ -34,6 +34,7 @@ import 'package:record/record.dart';
 import 'package:flutter_pdfview/flutter_pdfview.dart';
 
 import '../providers/auth_provider.dart';
+import '../utils/app_bar_gradient.dart';
 import '../utils/snackbar_helper.dart';
 
 import '../services/rocketchat_websocket_service.dart';
@@ -47,11 +48,6 @@ import 'dart:io' as io;
 
 import 'dart:typed_data';
 
-// ---------------------------------------------------------------------------
-
-// Helpers globaux pour le chargement d'images protégées
-
-// ---------------------------------------------------------------------------
 
 Future<Uint8List?> fetchProtectedImage(String url) async {
 
@@ -5056,7 +5052,8 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
 
               gradient: LinearGradient(
 
-                colors: isDark ? const [Color(0xFF1A003D), Color(0xFF3C0D73)] : const [Color(0xFF8E2DE2), Color(0xFF4A00E0)],
+                colors: isDark ? const [Color(0xFF1A003D), Color(0xFF3C0D73)]
+                  : const [Color(0xFF8E2DE2), Color(0xFF4A00E0)],
 
                 begin: Alignment.topLeft,
 
@@ -7337,7 +7334,11 @@ class _ImageViewerScreen extends StatelessWidget {
 
       appBar: AppBar(
 
-        backgroundColor: Colors.black,
+        backgroundColor: Colors.transparent,
+
+        elevation: 0,
+
+        flexibleSpace: AppBarGradient.flexibleSpace(isDark),
 
         iconTheme: const IconThemeData(color: Colors.white),
 
@@ -7648,9 +7649,15 @@ class _VideoPlayerScreenState extends State<_VideoPlayerScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
     return Scaffold(
       backgroundColor: Colors.black,
-      appBar: AppBar(backgroundColor: Colors.black, iconTheme: const IconThemeData(color: Colors.white)),
+      appBar: AppBar(
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        flexibleSpace: AppBarGradient.flexibleSpace(isDark),
+        iconTheme: const IconThemeData(color: Colors.white),
+      ),
       body: _errorMessage != null
           ? Center(child: Text(_errorMessage!, style: GoogleFonts.poppins(color: Colors.white)))
           : _isInitialized
@@ -7678,12 +7685,14 @@ class _PdfViewerScreen extends StatelessWidget {
     return Scaffold(
       backgroundColor: isDark ? Colors.grey[900] : Colors.grey[100],
       appBar: AppBar(
-        backgroundColor: isDark ? Colors.grey[900] : Colors.white,
-        iconTheme: IconThemeData(color: isDark ? Colors.white : Colors.black87),
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        flexibleSpace: AppBarGradient.flexibleSpace(isDark),
+        iconTheme: const IconThemeData(color: Colors.white),
         title: Text(
           fileName,
           style: GoogleFonts.poppins(
-            color: isDark ? Colors.white : Colors.black87,
+            color: Colors.white,
             fontSize: 16,
             fontWeight: FontWeight.w600,
           ),

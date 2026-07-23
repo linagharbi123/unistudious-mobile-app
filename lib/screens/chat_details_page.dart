@@ -14,6 +14,7 @@ import 'dart:io' as io;
 import 'dart:typed_data';
 import 'dart:developer' as developer;
 import '../providers/auth_provider.dart';
+import '../utils/app_bar_gradient.dart';
 
 class ChatDetailsPage extends StatefulWidget {
   final String contactName;
@@ -1351,7 +1352,9 @@ class _ImageViewerScreen extends StatelessWidget {
     return Scaffold(
       backgroundColor: Colors.black,
       appBar: AppBar(
-        backgroundColor: Colors.black,
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        flexibleSpace: AppBarGradient.flexibleSpace(isDark),
         iconTheme: const IconThemeData(color: Colors.white),
         title: Text(
           'Image',
@@ -1592,9 +1595,15 @@ class _VideoPlayerScreenState extends State<_VideoPlayerScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
     return Scaffold(
       backgroundColor: Colors.black,
-      appBar: AppBar(backgroundColor: Colors.black, iconTheme: const IconThemeData(color: Colors.white)),
+      appBar: AppBar(
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        flexibleSpace: AppBarGradient.flexibleSpace(isDark),
+        iconTheme: const IconThemeData(color: Colors.white),
+      ),
       body: _errorMessage != null
           ? Center(child: Text(_errorMessage!, style: GoogleFonts.poppins(color: Colors.white)))
           : _isInitialized
@@ -1734,11 +1743,13 @@ class _AudioPlayerScreenState extends State<_AudioPlayerScreen> {
     return Scaffold(
       backgroundColor: widget.isDark ? Colors.grey[900] : Colors.white,
       appBar: AppBar(
-        backgroundColor: widget.isDark ? Colors.grey[900] : Colors.white,
-        iconTheme: IconThemeData(color: widget.isDark ? Colors.white70 : Colors.black87),
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        flexibleSpace: AppBarGradient.flexibleSpace(widget.isDark),
+        iconTheme: const IconThemeData(color: Colors.white),
         title: Text(
           widget.fileName,
-          style: GoogleFonts.poppins(color: widget.isDark ? Colors.white : Colors.black87),
+          style: GoogleFonts.poppins(color: Colors.white),
         ),
       ),
       body: Center(
@@ -1823,12 +1834,14 @@ class _PdfViewerScreen extends StatelessWidget {
     return Scaffold(
       backgroundColor: isDark ? Colors.grey[900] : Colors.grey[100],
       appBar: AppBar(
-        backgroundColor: isDark ? Colors.grey[900] : Colors.white,
-        iconTheme: IconThemeData(color: isDark ? Colors.white : Colors.black87),
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        flexibleSpace: AppBarGradient.flexibleSpace(isDark),
+        iconTheme: const IconThemeData(color: Colors.white),
         title: Text(
           fileName,
           style: GoogleFonts.poppins(
-            color: isDark ? Colors.white : Colors.black87,
+            color: Colors.white,
             fontSize: 16,
             fontWeight: FontWeight.w600,
           ),

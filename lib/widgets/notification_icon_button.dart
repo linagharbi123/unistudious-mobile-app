@@ -8,7 +8,9 @@ import '../screens/notifications_list_page.dart';
 /// Affiche le nombre de notifications non lues et navigue vers la page de notifications au clic
 /// Inclut une animation lumineuse lorsqu'une nouvelle notification arrive
 class NotificationIconButton extends StatefulWidget {
-  const NotificationIconButton({super.key});
+  final GlobalKey? tutorialKey;
+
+  const NotificationIconButton({super.key, this.tutorialKey});
 
   @override
   State<NotificationIconButton> createState() => _NotificationIconButtonState();
@@ -113,7 +115,7 @@ class _NotificationIconButtonState extends State<NotificationIconButton>
         
         _lastUnreadCount = unreadCount;
 
-        return Stack(
+        final content = Stack(
           clipBehavior: Clip.none,
           children: [
             AnimatedBuilder(
@@ -183,6 +185,11 @@ class _NotificationIconButtonState extends State<NotificationIconButton>
               ),
           ],
         );
+
+        if (widget.tutorialKey != null) {
+          return KeyedSubtree(key: widget.tutorialKey, child: content);
+        }
+        return content;
       },
     );
   }

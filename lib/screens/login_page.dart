@@ -8,6 +8,8 @@ import '../models/user_model.dart';
 import '../providers/auth_provider.dart';
 import '../providers/theme_provider.dart';
 import '../utils/snackbar_helper.dart';
+import '../utils/action_guard.dart';
+import '../utils/guarded_navigation.dart';
 import 'google_login_page.dart';
 import 'facebook_login_page.dart';
 import 'apple_login_page.dart';
@@ -21,6 +23,8 @@ class _LoginPageState extends State<LoginPage> {
   final _usernameController = TextEditingController();
   final _passwordController = TextEditingController();
   final _formKey = GlobalKey<FormState>();
+  bool _obscurePassword = true;
+  bool _isLoading = false;
 
   @override
   void dispose() {
@@ -30,43 +34,64 @@ class _LoginPageState extends State<LoginPage> {
   }
 
   Future<void> _login() async {
-    if (!_formKey.currentState!.validate()) return;
+    if (_isLoading) return;
 
-    final authProvider = Provider.of<AuthProvider>(context, listen: false);
+    await ActionGuard.instance.run('login', () async {
+      if (!_formKey.currentState!.validate()) return;
 
-    try {
-      final success = await authProvider.login(
-        _usernameController.text.trim(),
-        _passwordController.text,
-      );
+      setState(() => _isLoading = true);
 
-      if (success) {
-        Provider.of<UserModel>(context, listen: false).updateUser(
-          name: 'Utilisateur',
-          email: 'user@unistudious.com',
+      final authProvider = Provider.of<AuthProvider>(context, listen: false);
+
+      try {
+        final success = await authProvider.login(
+          _usernameController.text.trim(),
+          _passwordController.text,
         );
-        Navigator.pushNamedAndRemoveUntil(context, '/dashboard', (route) => false);
-      } else {
-        final rawError = authProvider.error ?? '';
-        String displayMessage;
 
-        // Personnaliser le message pour les erreurs de type 401 / compte inexistant
-        if (rawError.contains('401') ||
-            rawError.toLowerCase().contains('unauthorized') ||
-            rawError.toLowerCase().contains('login failed')) {
-          displayMessage = 'Ce compte n\'existe pas ou le mot de passe est incorrect.';
-        } else if (rawError.isNotEmpty) {
-          displayMessage = rawError;
+        if (!mounted) return;
+
+        if (success) {
+          Provider.of<UserModel>(context, listen: false).updateUser(
+            name: 'Utilisateur',
+            email: 'user@unistudious.com',
+          );
+          Navigator.pushNamedAndRemoveUntil(context, '/dashboard', (route) => false);
         } else {
-          displayMessage = 'Échec de la connexion';
-        }
+          final rawError = authProvider.error ?? '';
+          String displayMessage;
 
-        SnackBarHelper.showError(context, displayMessage);
+          // Personnaliser le message pour les erreurs d'authentification
+          final lowerError = rawError.toLowerCase();
+          if (rawError.contains('401') ||
+              lowerError.contains('unauthorized') ||
+              lowerError.contains('login failed') ||
+              lowerError.contains('invalid credentials') ||
+              lowerError.contains('bad credentials') ||
+              lowerError.contains('invalid username') ||
+              lowerError.contains('invalid password')) {
+            displayMessage = 'Ce compte n\'existe pas ou le nom d\'utilisateur / mot de passe est incorrect.';
+          } else if (lowerError.contains('network') || lowerError.contains('connexion')) {
+            displayMessage = 'Erreur de connexion. Vérifiez votre connexion internet.';
+          } else if (rawError.isNotEmpty) {
+            displayMessage = rawError;
+          } else {
+            displayMessage = 'Échec de la connexion. Veuillez vérifier vos identifiants.';
+          }
+
+          SnackBarHelper.showError(context, displayMessage);
+        }
+      } catch (e) {
+        debugPrint('Erreur de connexion (LOGIN) : $e');
+        if (mounted) {
+          SnackBarHelper.showError(context, 'Erreur de connexion : $e');
+        }
+      } finally {
+        if (mounted) {
+          setState(() => _isLoading = false);
+        }
       }
-    } catch (e) {
-      debugPrint('Erreur de connexion (LOGIN) : $e');
-      SnackBarHelper.showError(context, 'Erreur de connexion : $e');
-    }
+    });
   }
 
   Widget _buildTextField({
@@ -74,6 +99,7 @@ class _LoginPageState extends State<LoginPage> {
     required String label,
     required IconData icon,
     bool obscure = false,
+    bool showPasswordToggle = false,
   }) {
     final theme = Theme.of(context);
     final isDark = theme.brightness == Brightness.dark;
@@ -89,6 +115,15 @@ class _LoginPageState extends State<LoginPage> {
           validator: (value) => (value == null || value.isEmpty) ? 'Ce champ est requis' : null,
           decoration: InputDecoration(
             prefixIcon: Icon(icon, color: Colors.deepPurple),
+            suffixIcon: showPasswordToggle
+                ? IconButton(
+                    icon: Icon(
+                      _obscurePassword ? Icons.visibility_off_outlined : Icons.visibility_outlined,
+                      color: Colors.deepPurple,
+                    ),
+                    onPressed: () => setState(() => _obscurePassword = !_obscurePassword),
+                  )
+                : null,
             labelText: label,
             labelStyle: TextStyle(color: isDark ? Colors.grey[400] : Colors.grey[600]),
             border: InputBorder.none,
@@ -101,15 +136,18 @@ class _LoginPageState extends State<LoginPage> {
   }
 
   Widget _buildElevatedButton({
-    required VoidCallback onPressed,
+    required VoidCallback? onPressed,
     required String label,
     IconData? icon,
     Widget? leading,
     Color? backgroundColor,
     Color? foregroundColor,
     Color? borderColor,
+    bool showLoadingState = false,
+    String? loadingLabel,
   }) {
     final theme = Theme.of(context);
+    final isDisabled = _isLoading || onPressed == null;
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 6.0),
       child: Card(
@@ -120,7 +158,7 @@ class _LoginPageState extends State<LoginPage> {
         ),
         elevation: 4,
         child: InkWell(
-          onTap: onPressed,
+          onTap: isDisabled ? null : onPressed,
           borderRadius: BorderRadius.circular(12),
           child: Container(
             padding: EdgeInsets.symmetric(vertical: 16, horizontal: 16),
@@ -132,13 +170,37 @@ class _LoginPageState extends State<LoginPage> {
                   Icon(icon, color: foregroundColor ?? theme.iconTheme.color, size: 24),
                 if (leading != null || icon != null) SizedBox(width: 12),
                 Expanded(
-                  child: Text(
-                    label,
-                    style: theme.textTheme.bodyLarge?.copyWith(
-                      fontWeight: FontWeight.w600,
-                      color: foregroundColor ?? theme.textTheme.bodyLarge?.color,
-                    ),
-                  ),
+                  child: showLoadingState && _isLoading
+                      ? Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            SizedBox(
+                              width: 20,
+                              height: 20,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                valueColor: AlwaysStoppedAnimation<Color>(
+                                  foregroundColor ?? Colors.white,
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 12),
+                            Text(
+                              loadingLabel ?? 'Chargement...',
+                              style: theme.textTheme.bodyLarge?.copyWith(
+                                fontWeight: FontWeight.w600,
+                                color: foregroundColor ?? theme.textTheme.bodyLarge?.color,
+                              ),
+                            ),
+                          ],
+                        )
+                      : Text(
+                          label,
+                          style: theme.textTheme.bodyLarge?.copyWith(
+                            fontWeight: FontWeight.w600,
+                            color: foregroundColor ?? theme.textTheme.bodyLarge?.color,
+                          ),
+                        ),
                 ),
               ],
             ),
@@ -195,20 +257,23 @@ class _LoginPageState extends State<LoginPage> {
                     controller: _passwordController,
                     label: 'Mot de passe',
                     icon: Icons.lock_outline,
-                    obscure: true,
+                    obscure: _obscurePassword,
+                    showPasswordToggle: true,
                   ),
                   SizedBox(height: 16),
                   _buildElevatedButton(
-                    onPressed: _login,
+                    onPressed: _login.guarded,
                     label: 'Se connecter',
                     icon: Icons.login,
                     backgroundColor: isDark ? const Color(0xFF1A003D) : Colors.deepPurple,
                     foregroundColor: Colors.white,
+                    showLoadingState: true,
+                    loadingLabel: 'Connexion...',
                   ),
                   SizedBox(height: 16),
                   Center(
                     child: GestureDetector(
-                      onTap: () => Navigator.pushNamed(context, '/forget-password'),
+                      onTap: () => context.pushNamedGuarded('/forget-password'),
                       child: Text(
                         'Mot de passe oublié ?',
                         style: TextStyle(
@@ -236,7 +301,9 @@ class _LoginPageState extends State<LoginPage> {
                   ),
                   SizedBox(height: 16),
                   _buildElevatedButton(
-                    onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => GoogleLoginPage())),
+                    onPressed: () => context.pushGuarded(
+                      MaterialPageRoute(builder: (_) => GoogleLoginPage()),
+                    ),
                     label: 'Continuer avec Google',
                     leading: Image.asset(
                       'assets/google.png',
@@ -256,7 +323,9 @@ class _LoginPageState extends State<LoginPage> {
                   //),
                   if (Platform.isIOS)
                     _buildElevatedButton(
-                      onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => AppleLoginPage())),
+                      onPressed: () => context.pushGuarded(
+                        MaterialPageRoute(builder: (_) => AppleLoginPage()),
+                      ),
                       label: 'Continuer avec Apple',
                       icon: Icons.apple,
                       backgroundColor: isDark ? Colors.grey[900] : Colors.black,
@@ -265,7 +334,7 @@ class _LoginPageState extends State<LoginPage> {
                   SizedBox(height: 24),
                   Center(
                     child: GestureDetector(
-                      onTap: () => Navigator.pushNamed(context, '/signup'),
+                      onTap: () => context.pushNamedGuarded('/signup'),
                       child: RichText(
                         text: TextSpan(
                           text: 'Vous n\'avez pas de compte ? ',

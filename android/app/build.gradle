@@ -9,6 +9,14 @@ plugins {
 configurations.all {
     exclude group: 'com.github.jiangdongguo.AndroidUSBCamera'
     exclude group: 'androidx.media3', module: 'media3-exoplayer-rtsp'
+
+    // Force 16 KB-aligned native libs (Google Play)
+    resolutionStrategy {
+        force 'com.google.mlkit:barcode-scanning:17.3.0'
+        force 'androidx.camera:camera-core:1.4.2'
+        force 'androidx.camera:camera-camera2:1.4.2'
+        force 'androidx.camera:camera-lifecycle:1.4.2'
+    }
 }
 
 /* Chargement des propriétés locales */
@@ -29,22 +37,23 @@ if (keystorePropertiesFile.exists()) {
 
 android {
     namespace "com.unistudious.projet1v2"
-    compileSdkVersion 35
+    compileSdkVersion 36
     ndkVersion "28.2.13676358"  // NDK r28+ pour support 16 KB (Google Play)
 
     packagingOptions {
         pickFirsts += ['lib/**/libc++_shared.so']
         jniLibs {
-            useLegacyPackaging = true  // Contourne 16KB: libs compressées (plugins pré-compilés non alignés)
+            // Google Play requires native libs packaged without legacy compression behavior.
+            useLegacyPackaging = false
         }
     }
 
     defaultConfig {
         applicationId "com.unistudious.projet1v2"
         minSdkVersion 26
-        targetSdkVersion flutter.targetSdkVersion
-        versionCode 19
-        versionName "1.0.17"
+        targetSdkVersion 36
+        versionCode 29
+        versionName "1.0.27"
     }
 
     /* ✅ OBLIGATOIRE pour flutter_local_notifications */
